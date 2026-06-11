@@ -1,0 +1,31 @@
+# Render Blueprint — deploy with "New +" -> "Blueprint" on https://dashboard.render.com
+# after connecting this GitHub repo. Free tier: spins down after ~15 min idle,
+# first request after that takes ~50s (the app's sync retries handle this).
+services:
+  - type: web
+    name: klaro-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        sync: false # paste your Neon connection string in the Render dashboard
+      - key: API_KEY
+        generateValue: true # Render generates a strong key; copy it into the app + dashboard
+      - key: GROQ_API_KEY
+        sync: false # paste your Groq key (free at console.groq.com/keys)
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: CORS_ORIGINS
+        value: "*" # tighten to your dashboard URL after deploying it, e.g. https://klaro-dashboard.vercel.app
+      - key: APP_TZ
+        value: Asia/Kolkata
+      # Free-tier Postgres allows few connections — keep the pool small.
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"
