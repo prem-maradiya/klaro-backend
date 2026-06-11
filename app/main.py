@@ -161,6 +161,12 @@ async def create_expense(
     data = payload.model_dump()
     merchant = data.get("merchant") or ""
 
+    # The phone sends timezone-naive local timestamps (IST wall-clock). Treat
+    # naive datetimes as APP_TZ — never as server time, which is UTC in the
+    # cloud and would shift every transaction by +5:30.
+    if data["date"].tzinfo is None:
+        data["date"] = data["date"].replace(tzinfo=APP_TZ)
+
     # Server-side dedupe: same SMS text + amount within a ±5 min window means a
     # retry or re-import, never a new transaction — return the existing row
     # (200) so clients can never double-count. Manual entries (no raw_sms) skip
