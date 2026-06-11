@@ -97,6 +97,16 @@ async def lifespan(app: FastAPI):
     yield
 
 
+# Serverless platforms (Vercel) don't run the ASGI lifespan — create tables at
+# import instead. Swallow failures (e.g. DATABASE_URL not configured yet) so
+# /health still works; data endpoints will surface the real error.
+if os.getenv("VERCEL"):
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception:
+        pass
+
+
 app = FastAPI(title="Expense Tracker API", version="1.0.0", lifespan=lifespan)
 
 
