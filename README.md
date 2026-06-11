@@ -26,25 +26,34 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - Phone over USB: `adb reverse tcp:8000 tcp:8000`, app backend URL `http://localhost:8000`
 - Phone over Wi-Fi: set the laptop's LAN IP in the app's Settings screen
 
-## Deploy to the cloud (Render + Neon, both free)
+## Cloud deployment (live)
 
-1. **Database — Neon** (https://neon.tech): create a free project, copy the
-   connection string (`postgresql://...neon.tech/neondb?sslmode=require`).
-   Use the **pooled** connection string.
-2. **API — Render** (https://render.com): New + → **Blueprint** → connect this
-   GitHub repo. `render.yaml` defines the service. When prompted, paste:
-   - `DATABASE_URL` = the Neon connection string
-   - `GROQ_API_KEY` = your Groq key (free at https://console.groq.com/keys)
-   - `API_KEY` is auto-generated — copy it from the service's Environment tab.
-3. Tables are created automatically on first start.
-4. Put the Render URL (`https://klaro-api.onrender.com`) + the API key into
-   the phone app (Settings) and the dashboard (gear icon → Connection).
-5. After deploying the dashboard, set `CORS_ORIGINS` on Render to its URL,
-   e.g. `https://klaro-dashboard.vercel.app`.
+**Deployed on Vercel: https://klaro-api.vercel.app** (project `klaro-api`,
+auto-deploys on push to this repo's master). Serverless entrypoint is
+`api/index.py`; `vercel.json` uses an explicit `builds` config on purpose —
+zero-config detection routes FastAPI apps into Vercel's framework preset,
+which broke this deploy in several ways (see `.vercelignore` note about
+render.yaml too).
 
-Free-tier note: Render spins the service down after ~15 min idle; the first
-request then takes ~50 s. The phone app's retry-sync handles this — a synced
-expense may just take a minute to land.
+Env vars (set on the Vercel project): `API_KEY`, `GROQ_API_KEY`, `GROQ_MODEL`,
+`CORS_ORIGINS`, `DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=3`, and — once the database
+exists — `DATABASE_URL`.
+
+**Remaining one-time step — database (Neon, free, ~5 min):**
+1. Sign up at https://neon.tech (free tier, no card), create a project.
+2. Copy the **pooled** connection string (`postgresql://...-pooler...neon.tech/neondb?sslmode=require`).
+3. `printf '%s' "<that string>" | npx vercel env add DATABASE_URL production`
+   (run in this folder), then `npx vercel deploy --prod --yes`.
+4. Tables are created automatically on first start.
+
+To migrate existing local data to Neon:
+`pg_dump -d expense_tracker | psql "<neon connection string>"`.
+
+### Alternative: Render (render.yaml)
+
+`render.yaml` is kept for deploying on https://render.com instead (New + →
+Blueprint → connect this repo). Note Render's free tier spins down after
+~15 min idle (~50 s cold start).
 
 ## Security
 

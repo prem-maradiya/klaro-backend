@@ -1,0 +1,9 @@
+# Never upload secrets.
+.env
+
+# render.yaml is the Render-deploy alternative; if uploaded, Vercel CLI treats
+# the repo as a "services" deployment and stops building api/ functions.
+render.yaml
+
+.venv
+__pycache__

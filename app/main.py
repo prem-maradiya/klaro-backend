@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -97,19 +98,14 @@ def _learned_mapping(db: Session, merchant: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup if they don't exist
-    Base.metadata.create_all(bind=engine)
-    yield
-
-
-# Serverless platforms (Vercel) don't run the ASGI lifespan — create tables at
-# import instead. Swallow failures (e.g. DATABASE_URL not configured yet) so
-# /health still works; data endpoints will surface the real error.
-if os.getenv("VERCEL"):
+    # Create tables on startup if they don't exist. Never fatal: with the DB
+    # unreachable (e.g. DATABASE_URL not configured yet in the cloud), /health
+    # must still work — data endpoints will surface the real error.
     try:
         Base.metadata.create_all(bind=engine)
     except Exception:
-        pass
+        logging.exception("create_all failed (database unreachable?) — continuing")
+    yield
 
 
 app = FastAPI(title="Expense Tracker API", version="1.0.0", lifespan=lifespan)
