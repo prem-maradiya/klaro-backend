@@ -1,5 +1,5 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ExpenseBase(BaseModel):
@@ -27,3 +27,13 @@ class ExpenseUpdate(BaseModel):
 class ExpenseOut(ExpenseBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
+
+
+class BudgetIn(BaseModel):
+    amount: float = Field(gt=0)
+
+
+class BudgetOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    category: str  # a category name, or "overall" for the whole month
+    amount: float

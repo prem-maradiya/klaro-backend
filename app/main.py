@@ -15,7 +15,7 @@ from pydantic import BaseModel
 
 from . import models, schemas
 from .database import Base, engine, get_db
-from .categorizer import categorize, normalize, ai_parse_sms
+from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
 
 # When set, every endpoint except / and /health requires this value in the
 # X-API-Key header. Leave unset for open local development.
@@ -331,6 +331,89 @@ async def categorize_merchant(merchant: str, raw_sms: str | None = None, db: Ses
     if not cat:
         cat, source = await categorize(merchant, raw_sms)
     return {"merchant": merchant, "category": cat, "source": source}
+
+
+# ---------------------------------------------------------------------------
+# Budgets — monthly limits shared by the app and the dashboard. Keyed by
+# category name; "overall" caps the whole month.
+# ---------------------------------------------------------------------------
+
+def _valid_budget_category(category: str) -> str:
+    if category == "overall" or category in CATEGORIES:
+        return category
+    raise HTTPException(
+        status_code=422,
+        detail=f"category must be 'overall' or one of {CATEGORIES}",
+    )
+
+
+@app.get("/budgets", response_model=list[schemas.BudgetOut])
+def list_budgets(db: Session = Depends(get_db)):
+    return db.scalars(select(models.Budget).order_by(models.Budget.category)).all()
+
+
+@app.put("/budgets/{category}", response_model=schemas.BudgetOut)
+def upsert_budget(
+    category: str, payload: schemas.BudgetIn, db: Session = Depends(get_db)
+):
+    category = _valid_budget_category(category)
+    row = db.get(models.Budget, category)
+    if row:
+        row.amount = payload.amount
+        row.updated_at = datetime.now(timezone.utc)
+    else:
+        row = models.Budget(category=category, amount=payload.amount)
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.delete("/budgets/{category}", status_code=204)
+def delete_budget(category: str, db: Session = Depends(get_db)):
+    row = db.get(models.Budget, category)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Budget not found")
+    db.delete(row)
+    db.commit()
+
+
+@app.get("/budgets/status")
+def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
+    """Each budget with how much of it is spent in the month (default: current
+    month, app timezone) — one call for progress bars."""
+    if month is None:
+        now = datetime.now(APP_TZ)
+        month = f"{now.year:04d}-{now.month:02d}"
+    start, end = _month_bounds(month)
+
+    spent_rows = db.execute(
+        select(
+            func.coalesce(models.Expense.category, "Other"),
+            func.sum(models.Expense.amount),
+        )
+        .where(
+            models.Expense.is_labeled.is_(True),
+            models.Expense.date >= start,
+            models.Expense.date < end,
+        )
+        .group_by(models.Expense.category)
+    ).all()
+    spent: dict[str, float] = {}
+    for cat, amt in spent_rows:
+        spent[cat] = spent.get(cat, 0.0) + float(amt or 0)
+    overall_spent = sum(spent.values())
+
+    out = []
+    for b in db.scalars(select(models.Budget).order_by(models.Budget.category)):
+        used = overall_spent if b.category == "overall" else spent.get(b.category, 0.0)
+        out.append({
+            "category": b.category,
+            "amount": b.amount,
+            "spent": round(used, 2),
+            "pct": round(used / b.amount * 100, 1) if b.amount else 0.0,
+        })
+    return {"month": month, "budgets": out}
 
 
 @app.get("/summary")

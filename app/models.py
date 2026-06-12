@@ -23,6 +23,19 @@ class Expense(Base):
     )
 
 
+class Budget(Base):
+    """Monthly spending limits, shared by the phone app and the dashboard.
+    One row per category; the row with category="overall" caps the whole month
+    (lowercase sentinel — real categories are capitalized, so no collision)."""
+    __tablename__ = "budgets"
+
+    category: Mapped[str] = mapped_column(String(100), primary_key=True)
+    amount: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class MerchantCategory(Base):
     """Learned merchant -> category mappings. Grows as the user labels things
     and as the AI classifies unknown merchants (cached so each is done once)."""
