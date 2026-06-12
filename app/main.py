@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -56,7 +57,11 @@ def _month_bounds(month: str) -> tuple[datetime, datetime]:
 def _sms_hash(raw_sms: str | None) -> str | None:
     if not raw_sms or not raw_sms.strip():
         return None
-    return hashlib.sha256(raw_sms.strip().encode("utf-8")).hexdigest()
+    # Hash with ALL whitespace removed: the same SMS arrives with slightly
+    # different spacing depending on the capture path (live broadcast vs inbox
+    # read — observed "<Mob.No>" vs "<Mob. No>" in one IDBI message), and that
+    # must not defeat dedupe.
+    return hashlib.sha256(re.sub(r"\s+", "", raw_sms).encode("utf-8")).hexdigest()
 
 
 def _learned_category(db: Session, merchant: str) -> str | None:
