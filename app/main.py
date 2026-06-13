@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 import logging
 import os
 import re
@@ -451,3 +453,64 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
         "month_total": round(sum(totals.values()), 2),
         "by_category": totals,
     }
+
+
+@app.get("/export")
+def export_csv(
+    month: str | None = None,
+    year: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """Download transactions as CSV (opens cleanly in Excel/Sheets). Scope:
+    `?month=YYYY-MM` -> that month, `?year=YYYY` -> that whole year, neither ->
+    everything. Rows are newest-first; dates are rendered in the app timezone."""
+    stmt = select(models.Expense)
+    scope = "all"
+    if month:
+        start, end = _month_bounds(month)
+        stmt = stmt.where(models.Expense.date >= start, models.Expense.date < end)
+        scope = month
+    elif year is not None:
+        if not 2000 <= year <= 2100:
+            raise HTTPException(status_code=422, detail="year out of range")
+        start = datetime(year, 1, 1, tzinfo=APP_TZ)
+        end = datetime(year + 1, 1, 1, tzinfo=APP_TZ)
+        stmt = stmt.where(models.Expense.date >= start, models.Expense.date < end)
+        scope = str(year)
+
+    rows = db.scalars(stmt.order_by(models.Expense.date.desc())).all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["Date", "Merchant", "Category", "Amount", "Method", "UPI ID", "Labeled", "Raw SMS"]
+    )
+    for e in rows:
+        d = e.date
+        if d is not None:
+            # Naive timestamps are app-local wall-clock; aware ones are UTC in
+            # the DB — normalize both to the app timezone for a sensible export.
+            d = (d.replace(tzinfo=APP_TZ) if d.tzinfo is None else d).astimezone(APP_TZ)
+            date_str = d.strftime("%Y-%m-%d %H:%M")
+        else:
+            date_str = ""
+        writer.writerow([
+            date_str,
+            e.merchant or "",
+            e.category or "",
+            f"{e.amount:.2f}",
+            e.method or "",
+            e.upi_id or "",
+            "yes" if e.is_labeled else "no",
+            # Keep each transaction on one CSV row even if the SMS had newlines.
+            (e.raw_sms or "").replace("\r", " ").replace("\n", " "),
+        ])
+
+    # Lead with a UTF-8 BOM so Excel renders the ₹ sign and other unicode right.
+    body = "﻿" + buf.getvalue()
+    filename = f"klaro-expenses-{scope}.csv"
+    return Response(
+        content=body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
