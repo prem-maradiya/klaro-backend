@@ -11,6 +11,7 @@ class ExpenseBase(BaseModel):
     is_labeled: bool = True
     category: str | None = None
     method: str = "upi"  # upi | card
+    direction: str = "debit"  # debit = money out, credit = money in (income)
 
 
 class ExpenseCreate(ExpenseBase):

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
 
 from pydantic import BaseModel
@@ -103,15 +103,31 @@ def _learned_mapping(db: Session, merchant: str):
     return db.get(models.MerchantCategory, norm) if norm else None
 
 
+def _ensure_schema() -> None:
+    """Idempotent column adds that create_all can't apply to an existing table
+    (it only creates whole missing tables). Runs on every startup so a deploy
+    self-migrates both local dev and the cloud DB — no manual step. Postgres
+    `IF NOT EXISTS` makes each a no-op once applied."""
+    with engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS direction "
+            "VARCHAR(10) NOT NULL DEFAULT 'debit'"
+        ))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_expenses_direction ON expenses (direction)"
+        ))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables on startup if they don't exist. Never fatal: with the DB
-    # unreachable (e.g. DATABASE_URL not configured yet in the cloud), /health
+    # Create tables / apply additive migrations on startup. Never fatal: with the
+    # DB unreachable (e.g. DATABASE_URL not configured yet in the cloud), /health
     # must still work — data endpoints will surface the real error.
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_schema()
     except Exception:
-        logging.exception("create_all failed (database unreachable?) — continuing")
+        logging.exception("schema setup failed (database unreachable?) — continuing")
     yield
 
 
@@ -196,25 +212,33 @@ async def create_expense(
             response.status_code = 200
             return existing
 
-    # Apply any learned mapping for this merchant: a remembered RENAME (preferred
-    # display name) and/or category. This makes the user's corrections persist,
-    # apply to ALL future transactions, and survive re-imports.
-    mapping = _learned_mapping(db, merchant)
-    if mapping:
-        if mapping.merchant_display and normalize(mapping.merchant_display) != normalize(merchant):
-            data["merchant"] = mapping.merchant_display
-        if mapping.category:
-            data["category"] = mapping.category
-            data["is_labeled"] = True
+    if data.get("direction") == "credit":
+        # Income: the "merchant" is the payer, not a vendor — so don't run spend
+        # categorization or learn a merchant->category mapping from it (that would
+        # poison future debits). Just file it under the Income bucket.
+        if not data.get("category"):
+            data["category"] = "Income"
+        data["is_labeled"] = True
+    else:
+        # Apply any learned mapping for this merchant: a remembered RENAME (preferred
+        # display name) and/or category. This makes the user's corrections persist,
+        # apply to ALL future transactions, and survive re-imports.
+        mapping = _learned_mapping(db, merchant)
+        if mapping:
+            if mapping.merchant_display and normalize(mapping.merchant_display) != normalize(merchant):
+                data["merchant"] = mapping.merchant_display
+            if mapping.category:
+                data["category"] = mapping.category
+                data["is_labeled"] = True
 
-    # Auto-categorize anything still unlabeled (brand -> keyword -> AI).
-    if not data.get("is_labeled") or not data.get("category"):
-        cat, source = await categorize(data.get("merchant") or "", data.get("raw_sms"))
-        if cat:
-            data["category"] = cat
-            data["is_labeled"] = True
-            if source in ("ai", "brand", "keyword"):
-                _remember(db, merchant, cat, source)
+        # Auto-categorize anything still unlabeled (brand -> keyword -> AI).
+        if not data.get("is_labeled") or not data.get("category"):
+            cat, source = await categorize(data.get("merchant") or "", data.get("raw_sms"))
+            if cat:
+                data["category"] = cat
+                data["is_labeled"] = True
+                if source in ("ai", "brand", "keyword"):
+                    _remember(db, merchant, cat, source)
 
     expense = models.Expense(**data)
     db.add(expense)
@@ -254,11 +278,16 @@ def list_months(db: Session = Depends(get_db)):
     month_expr = func.to_char(
         func.timezone(APP_TZ_NAME, models.Expense.date), "YYYY-MM"
     ).label("month")
+    # `total` is spending (debits) only, so the selector matches "spent". `count`
+    # still includes every transaction in the month (income + spends).
+    spend_sum = func.sum(
+        case((models.Expense.direction == "debit", models.Expense.amount), else_=0.0)
+    )
     rows = db.execute(
         select(
             month_expr,
             func.count(models.Expense.id),
-            func.sum(models.Expense.amount),
+            spend_sum,
         )
         .group_by(month_expr)
         .order_by(month_expr.desc())
@@ -401,6 +430,7 @@ def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
         )
         .where(
             models.Expense.is_labeled.is_(True),
+            models.Expense.direction == "debit",  # budgets cap spending, not income
             models.Expense.date >= start,
             models.Expense.date < end,
         )
@@ -439,6 +469,7 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
         )
         .where(
             models.Expense.is_labeled.is_(True),
+            models.Expense.direction == "debit",  # spending only; income is separate
             models.Expense.date >= start,
             models.Expense.date < end,
         )
@@ -448,10 +479,24 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
     totals: dict[str, float] = {}
     for cat, amt in rows:  # NULL and literal "Other" both land on "Other"
         totals[cat] = round(totals.get(cat, 0.0) + float(amt or 0), 2)
+    expense_total = round(sum(totals.values()), 2)
+
+    # Income (credits) in the same month — drives the in/out net-flow view.
+    income_total = round(float(db.scalar(
+        select(func.coalesce(func.sum(models.Expense.amount), 0.0)).where(
+            models.Expense.direction == "credit",
+            models.Expense.date >= start,
+            models.Expense.date < end,
+        )
+    ) or 0.0), 2)
+
     return {
         "month": month,
-        "month_total": round(sum(totals.values()), 2),
+        "month_total": expense_total,  # spending only — kept for back-compat
         "by_category": totals,
+        "income_total": income_total,
+        "expense_total": expense_total,
+        "net": round(income_total - expense_total, 2),
     }
 
 
@@ -483,7 +528,7 @@ def export_csv(
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
-        ["Date", "Merchant", "Category", "Amount", "Method", "UPI ID", "Labeled", "Raw SMS"]
+        ["Date", "Merchant", "Category", "Amount", "Direction", "Method", "UPI ID", "Labeled", "Raw SMS"]
     )
     for e in rows:
         d = e.date
@@ -499,6 +544,7 @@ def export_csv(
             e.merchant or "",
             e.category or "",
             f"{e.amount:.2f}",
+            e.direction or "debit",
             e.method or "",
             e.upi_id or "",
             "yes" if e.is_labeled else "no",

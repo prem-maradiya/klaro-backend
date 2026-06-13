@@ -18,6 +18,11 @@ class Expense(Base):
     is_labeled: Mapped[bool] = mapped_column(Boolean, default=True)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     method: Mapped[str] = mapped_column(String(20), default="upi")  # upi | card
+    # debit = money out (a spend, the default), credit = money in (income).
+    # Indexed because every spending aggregate filters on it.
+    direction: Mapped[str] = mapped_column(
+        String(10), default="debit", server_default="debit", index=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
