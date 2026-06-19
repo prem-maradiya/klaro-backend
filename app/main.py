@@ -707,11 +707,52 @@ def recurring(db: Session = Depends(get_db)):
         if key:
             groups[key].append(e)
 
+    # Detections the user has dismissed ("I cancelled this") — keyed by the same
+    # normalized merchant the detector groups on, so they're skipped here.
+    dismissed_rows = db.scalars(select(models.RecurringDismissal)).all()
+    dismissed = {d.merchant_norm for d in dismissed_rows}
+
     today = datetime.now(APP_TZ)
-    out = [d for items in groups.values() if (d := _detect_recurring(items, today))]
+    out = [
+        d
+        for key, items in groups.items()
+        if key not in dismissed and (d := _detect_recurring(items, today))
+    ]
     out.sort(key=lambda r: r["next_due"])
 
     monthly_total = round(
         sum(r["amount"] * _MONTHLY_FACTOR.get(r["cadence"], 1.0) for r in out), 2
     )
-    return {"count": len(out), "monthly_total": monthly_total, "recurring": out}
+    return {
+        "count": len(out),
+        "monthly_total": monthly_total,
+        "recurring": out,
+        "dismissed": [d.merchant_display for d in dismissed_rows],
+    }
+
+
+class DismissIn(BaseModel):
+    merchant: str
+
+
+@app.post("/recurring/dismiss")
+def dismiss_recurring(payload: DismissIn, db: Session = Depends(get_db)):
+    """Hide a detected recurring payment (the user cancelled the subscription /
+    doesn't want it tracked). Idempotent; reversible via DELETE."""
+    norm = normalize(payload.merchant)
+    if not norm:
+        raise HTTPException(status_code=400, detail="merchant required")
+    if db.get(models.RecurringDismissal, norm) is None:
+        db.add(models.RecurringDismissal(
+            merchant_norm=norm, merchant_display=payload.merchant))
+        db.commit()
+    return {"merchant": payload.merchant, "dismissed": True}
+
+
+@app.delete("/recurring/dismiss/{merchant}", status_code=204)
+def restore_recurring(merchant: str, db: Session = Depends(get_db)):
+    """Un-dismiss a recurring payment so it can be detected again (undo)."""
+    row = db.get(models.RecurringDismissal, normalize(merchant))
+    if row is not None:
+        db.delete(row)
+        db.commit()

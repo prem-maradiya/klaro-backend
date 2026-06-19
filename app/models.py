@@ -41,6 +41,20 @@ class Budget(Base):
     )
 
 
+class RecurringDismissal(Base):
+    """Recurring detections the user dismissed ("I cancelled this subscription").
+    Excluded from /recurring. Keyed by the normalized merchant so it matches the
+    detector's grouping; the display name is kept for restore UIs. A whole new
+    table, so create_all provisions it on startup (no column migration needed)."""
+    __tablename__ = "recurring_dismissals"
+
+    merchant_norm: Mapped[str] = mapped_column(String(255), primary_key=True)
+    merchant_display: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class MerchantCategory(Base):
     """Learned merchant -> category mappings. Grows as the user labels things
     and as the AI classifies unknown merchants (cached so each is done once)."""
