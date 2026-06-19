@@ -4,8 +4,10 @@ import io
 import logging
 import os
 import re
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from statistics import median
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -560,3 +562,143 @@ def export_csv(
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Recurring payments — subscriptions, EMIs, regular bills. Detected from spend
+# history (a stable amount on a regular cadence) or a known subscription brand,
+# with the next due date predicted forward.
+# ---------------------------------------------------------------------------
+
+# Known subscriptions (normalized merchant fragment -> cadence days). Recurring
+# even from a single charge, since we know what they are.
+_RECURRING_BRANDS = {
+    "netflix": 30,
+    "spotify": 30,
+    "hotstar": 30,
+    "disneyhotstar": 30,
+    "amazonprime": 30,
+    "primevideo": 30,
+    "jiocinema": 30,
+    "youtubepremium": 30,
+}
+
+# (label, canonical period in days, low gap, high gap)
+_CADENCE_BANDS = [
+    ("Weekly", 7, 6, 9),
+    ("Fortnightly", 14, 12, 16),
+    ("Monthly", 30, 26, 34),
+    ("Bi-monthly", 61, 56, 66),
+    ("Quarterly", 91, 84, 98),
+    ("Half-yearly", 182, 172, 196),
+    ("Yearly", 365, 350, 385),
+]
+
+_MONTHLY_FACTOR = {
+    "Weekly": 30 / 7,
+    "Fortnightly": 30 / 14,
+    "Monthly": 1.0,
+    "Bi-monthly": 0.5,
+    "Quarterly": 1 / 3,
+    "Half-yearly": 1 / 6,
+    "Yearly": 1 / 12,
+}
+
+# Categories that are people, transfers or variable discretionary spend — repeats
+# there are coincidence (two payments to a friend, two food orders), not a
+# subscription. Pattern detection skips them; known brands are still caught.
+_RECURRING_EXCLUDE_CATS = {"Personal", "Transfer", "Cash", "Food", "Grocery"}
+
+
+def _cadence_for(days: float):
+    for label, period, lo, hi in _CADENCE_BANDS:
+        if lo <= days <= hi:
+            return label, period
+    return None
+
+
+def _to_app_tz(d: datetime) -> datetime:
+    return (d.replace(tzinfo=APP_TZ) if d.tzinfo is None else d).astimezone(APP_TZ)
+
+
+def _detect_recurring(items: list, today: datetime) -> dict | None:
+    """`items`: one merchant's debits, oldest-first. Returns a recurring
+    descriptor (merchant, typical amount, cadence, last/next dates) or None."""
+    last = items[-1]
+    merchant = last.merchant or ""
+    amounts = [e.amount for e in items]
+    typical = round(median(amounts), 2)
+    last_d = _to_app_tz(last.date)
+
+    label = period = source = None
+
+    if len(items) >= 2 and last.category not in _RECURRING_EXCLUDE_CATS:
+        dates = [_to_app_tz(e.date) for e in items]
+        gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+        gaps = [g for g in gaps if g >= 3]  # ignore same-day repeats
+        if gaps:
+            band = _cadence_for(median(gaps))
+            # Subscriptions/EMIs hold a steady amount — require all within 15%.
+            stable = typical > 0 and all(
+                abs(a - typical) <= max(0.15 * typical, 1.0) for a in amounts
+            )
+            if band and stable:
+                label, period = band
+                source = "pattern"
+
+    if source is None:
+        key = normalize(merchant)
+        for brand, days in _RECURRING_BRANDS.items():
+            if brand in key:
+                label, period, source = "Monthly", days, "brand"
+                break
+
+    if source is None:
+        return None
+
+    # Drop ones that look dead — nothing charged for well over two cycles.
+    if (today.date() - last_d.date()).days > period * 2 + 7:
+        return None
+
+    # Roll the prediction forward to the next future occurrence.
+    next_due = last_d
+    while next_due.date() <= today.date():
+        next_due += timedelta(days=period)
+
+    return {
+        "merchant": merchant,
+        "amount": typical,
+        "category": last.category,
+        "cadence": label,
+        "occurrences": len(items),
+        "last_paid": last_d.date().isoformat(),
+        "next_due": next_due.date().isoformat(),
+        "source": source,
+    }
+
+
+@app.get("/recurring")
+def recurring(db: Session = Depends(get_db)):
+    """Detected recurring payments (subscriptions, EMIs, regular bills) with the
+    next due date predicted for each — soonest first, plus the monthly-equivalent
+    total they add up to."""
+    rows = db.scalars(
+        select(models.Expense)
+        .where(models.Expense.direction == "debit")
+        .order_by(models.Expense.date.asc())
+    ).all()
+
+    groups: dict[str, list] = defaultdict(list)
+    for e in rows:
+        key = normalize(e.merchant or "")
+        if key:
+            groups[key].append(e)
+
+    today = datetime.now(APP_TZ)
+    out = [d for items in groups.values() if (d := _detect_recurring(items, today))]
+    out.sort(key=lambda r: r["next_due"])
+
+    monthly_total = round(
+        sum(r["amount"] * _MONTHLY_FACTOR.get(r["cadence"], 1.0) for r in out), 2
+    )
+    return {"count": len(out), "monthly_total": monthly_total, "recurring": out}
