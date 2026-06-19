@@ -609,6 +609,15 @@ _MONTHLY_FACTOR = {
 # subscription. Pattern detection skips them; known brands are still caught.
 _RECURRING_EXCLUDE_CATS = {"Personal", "Transfer", "Cash", "Food", "Grocery"}
 
+# Words in a bank SMS that all but guarantee a recurring debit (EMI instalment,
+# SIP, an executed UPI mandate / NACH auto-debit). High precision, so a single
+# charge carrying one of these is treated as recurring (assumed monthly).
+_RECURRING_RE = re.compile(
+    r"\b(?:emi|sip|nach|mandate|auto\s*-?\s*pay|auto\s*-?\s*debit|"
+    r"standing\s+instruction|subscription|recurring)\b",
+    re.IGNORECASE,
+)
+
 
 def _cadence_for(days: float):
     for label, period, lo, hi in _CADENCE_BANDS:
@@ -652,6 +661,10 @@ def _detect_recurring(items: list, today: datetime) -> dict | None:
             if brand in key:
                 label, period, source = "Monthly", days, "brand"
                 break
+
+    if source is None and any(_RECURRING_RE.search(e.raw_sms or "") for e in items):
+        # EMI / SIP / autopay mandate — recurring even from a single charge.
+        label, period, source = "Monthly", 30, "keyword"
 
     if source is None:
         return None
