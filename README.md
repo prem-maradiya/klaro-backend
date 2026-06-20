@@ -26,6 +26,17 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - Phone over USB: `adb reverse tcp:8000 tcp:8000`, app backend URL `http://localhost:8000`
 - Phone over Wi-Fi: set the laptop's LAN IP in the app's Settings screen
 
+## Tests
+
+```powershell
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+The suite runs against in-memory SQLite (no Postgres needed) and covers dedupe,
+income/spending separation, budgets, recurring detection + dismiss/restore, and
+learned renames. CI runs it on every push (`.github/workflows/tests.yml`).
+
 ## Cloud deployment (live)
 
 **Deployed on Vercel: https://klaro-api.vercel.app** (project `klaro-api`,
