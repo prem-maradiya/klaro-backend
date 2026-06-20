@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
 
@@ -21,10 +20,11 @@ from pydantic import BaseModel
 from . import models, schemas
 from .database import Base, engine, get_db
 from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
+from .auth import get_current_user
 
-# When set, every endpoint except / and /health requires this value in the
-# X-API-Key header. Leave unset for open local development.
-API_KEY = os.getenv("API_KEY", "").strip()
+# Auth is per-user now (Phase 7.1): data routes depend on get_current_user,
+# which verifies a Supabase JWT and yields the user's id. The old global
+# X-API-Key gate is gone; "/" and "/health" stay open for uptime checks.
 
 # Comma-separated allowed origins for the browser dashboard
 # (e.g. "https://klaro-dashboard.vercel.app,http://localhost:5173").
@@ -68,23 +68,24 @@ def _sms_hash(raw_sms: str | None) -> str | None:
     return hashlib.sha256(re.sub(r"\s+", "", raw_sms).encode("utf-8")).hexdigest()
 
 
-def _learned_category(db: Session, merchant: str) -> str | None:
+def _learned_category(db: Session, user_id: str, merchant: str) -> str | None:
     norm = normalize(merchant)
     if not norm:
         return None
-    row = db.get(models.MerchantCategory, norm)
+    row = db.get(models.MerchantCategory, (user_id, norm))
     return row.category if row else None
 
 
-def _remember(db: Session, merchant: str, category: str | None = None,
+def _remember(db: Session, user_id: str, merchant: str, category: str | None = None,
               source: str = "user", display: str | None = None):
-    """Learn a merchant. `merchant` is the key (normalized). `display` is the
-    preferred name to show (defaults to merchant) — used to learn RENAMES so a
-    parsed name maps to the user's chosen name on future transactions."""
+    """Learn a merchant for this user. `merchant` is the key (normalized).
+    `display` is the preferred name to show (defaults to merchant) — used to
+    learn RENAMES so a parsed name maps to the user's chosen name on future
+    transactions."""
     norm = normalize(merchant)
     if not norm:
         return
-    row = db.get(models.MerchantCategory, norm)
+    row = db.get(models.MerchantCategory, (user_id, norm))
     if row:
         if category:
             row.category = category
@@ -93,6 +94,7 @@ def _remember(db: Session, merchant: str, category: str | None = None,
         row.source = source
     else:
         db.add(models.MerchantCategory(
+            user_id=user_id,
             merchant_norm=norm,
             merchant_display=display or merchant,
             category=category or "Other",
@@ -100,9 +102,9 @@ def _remember(db: Session, merchant: str, category: str | None = None,
         ))
 
 
-def _learned_mapping(db: Session, merchant: str):
+def _learned_mapping(db: Session, user_id: str, merchant: str):
     norm = normalize(merchant)
-    return db.get(models.MerchantCategory, norm) if norm else None
+    return db.get(models.MerchantCategory, (user_id, norm)) if norm else None
 
 
 def _ensure_schema() -> None:
@@ -136,25 +138,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Expense Tracker API", version="1.0.0", lifespan=lifespan)
 
 
-# Paths that stay open so uptime checks and the app's connection test work
-# without credentials.
-_AUTH_EXEMPT = {"/", "/health"}
-
-
-@app.middleware("http")
-async def require_api_key(request, call_next):
-    if (
-        API_KEY
-        and request.method != "OPTIONS"  # CORS preflight carries no custom headers
-        and request.url.path not in _AUTH_EXEMPT
-        and request.headers.get("x-api-key") != API_KEY
-    ):
-        return JSONResponse(
-            status_code=401, content={"detail": "Invalid or missing API key"}
-        )
-    return await call_next(request)
-
-
 # Allow the Flutter app (mobile + web dashboard) to call the API.
 # Added after the auth middleware so it runs first and answers preflights.
 app.add_middleware(
@@ -182,8 +165,10 @@ async def create_expense(
     payload: schemas.ExpenseCreate,
     response: Response,
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
 ):
     data = payload.model_dump()
+    data["user_id"] = user_id
     merchant = data.get("merchant") or ""
 
     # The phone sends timezone-naive local timestamps (IST wall-clock). Treat
@@ -203,6 +188,7 @@ async def create_expense(
         existing = db.scalars(
             select(models.Expense)
             .where(
+                models.Expense.user_id == user_id,
                 models.Expense.raw_sms_hash == sms_hash,
                 models.Expense.amount == data["amount"],
                 models.Expense.date >= data["date"] - window,
@@ -225,7 +211,7 @@ async def create_expense(
         # Apply any learned mapping for this merchant: a remembered RENAME (preferred
         # display name) and/or category. This makes the user's corrections persist,
         # apply to ALL future transactions, and survive re-imports.
-        mapping = _learned_mapping(db, merchant)
+        mapping = _learned_mapping(db, user_id, merchant)
         if mapping:
             if mapping.merchant_display and normalize(mapping.merchant_display) != normalize(merchant):
                 data["merchant"] = mapping.merchant_display
@@ -240,7 +226,7 @@ async def create_expense(
                 data["category"] = cat
                 data["is_labeled"] = True
                 if source in ("ai", "brand", "keyword"):
-                    _remember(db, merchant, cat, source)
+                    _remember(db, user_id, merchant, cat, source)
 
     expense = models.Expense(**data)
     db.add(expense)
@@ -257,8 +243,9 @@ def list_expenses(
     unlabeled_only: bool = False,
     month: str | None = None,
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
 ):
-    stmt = select(models.Expense)
+    stmt = select(models.Expense).where(models.Expense.user_id == user_id)
     if unlabeled_only:
         stmt = stmt.where(models.Expense.is_labeled.is_(False))
     if month:
@@ -274,7 +261,10 @@ def list_expenses(
 
 
 @app.get("/months")
-def list_months(db: Session = Depends(get_db)):
+def list_months(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Distinct months that have expenses (newest first) with count + total —
     drives the dashboard's month selector without fetching every row."""
     month_expr = func.to_char(
@@ -291,6 +281,7 @@ def list_months(db: Session = Depends(get_db)):
             func.count(models.Expense.id),
             spend_sum,
         )
+        .where(models.Expense.user_id == user_id)
         .group_by(month_expr)
         .order_by(month_expr.desc())
     ).all()
@@ -300,12 +291,22 @@ def list_months(db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/expenses/{expense_id}", response_model=schemas.ExpenseOut)
-def get_expense(expense_id: int, db: Session = Depends(get_db)):
+def _owned_expense(db: Session, expense_id: int, user_id: str) -> models.Expense:
+    """Fetch an expense and assert it belongs to the caller. 404 (not 403) on a
+    miss so we never reveal that someone else's id exists."""
     expense = db.get(models.Expense, expense_id)
-    if expense is None:
+    if expense is None or expense.user_id != user_id:
         raise HTTPException(status_code=404, detail="Expense not found")
     return expense
+
+
+@app.get("/expenses/{expense_id}", response_model=schemas.ExpenseOut)
+def get_expense(
+    expense_id: int,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    return _owned_expense(db, expense_id, user_id)
 
 
 @app.patch("/expenses/{expense_id}", response_model=schemas.ExpenseOut)
@@ -313,10 +314,9 @@ def update_expense(
     expense_id: int,
     payload: schemas.ExpenseUpdate,
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
 ):
-    expense = db.get(models.Expense, expense_id)
-    if expense is None:
-        raise HTTPException(status_code=404, detail="Expense not found")
+    expense = _owned_expense(db, expense_id, user_id)
 
     old_merchant = expense.merchant
     for field, value in payload.model_dump(exclude_unset=True).items():
@@ -324,11 +324,11 @@ def update_expense(
 
     # Learn the user's correction so it auto-applies to future transactions.
     if expense.merchant and expense.category:
-        _remember(db, expense.merchant, expense.category, source="user")
+        _remember(db, user_id, expense.merchant, expense.category, source="user")
         # Rename learning: map the ORIGINAL parsed name -> the user's chosen
         # name, so future SMS that parse to the original show the user's name.
         if normalize(old_merchant) and normalize(old_merchant) != normalize(expense.merchant):
-            _remember(db, old_merchant, expense.category, source="user", display=expense.merchant)
+            _remember(db, user_id, old_merchant, expense.category, source="user", display=expense.merchant)
 
     db.commit()
     db.refresh(expense)
@@ -336,11 +336,12 @@ def update_expense(
 
 
 @app.delete("/expenses/{expense_id}", status_code=204)
-def delete_expense(expense_id: int, db: Session = Depends(get_db)):
-    expense = db.get(models.Expense, expense_id)
-    if expense is None:
-        raise HTTPException(status_code=404, detail="Expense not found")
-    db.delete(expense)
+def delete_expense(
+    expense_id: int,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    db.delete(_owned_expense(db, expense_id, user_id))
     db.commit()
 
 
@@ -350,21 +351,30 @@ class ParseSmsIn(BaseModel):
 
 
 @app.post("/parse-sms")
-async def parse_sms(payload: ParseSmsIn, db: Session = Depends(get_db)):
+async def parse_sms(
+    payload: ParseSmsIn,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """AI fallback parser for bank SMS the on-device regex couldn't handle.
     Returns a structured transaction (or is_transaction=false)."""
     result = await ai_parse_sms(payload.body, payload.sender)
     # Cache the merchant->category so future identical merchants are instant.
     if result.get("is_transaction") and result.get("category") and result.get("merchant"):
-        _remember(db, result["merchant"], result["category"], source="ai")
+        _remember(db, user_id, result["merchant"], result["category"], source="ai")
         db.commit()
     return result
 
 
 @app.get("/categorize")
-async def categorize_merchant(merchant: str, raw_sms: str | None = None, db: Session = Depends(get_db)):
+async def categorize_merchant(
+    merchant: str,
+    raw_sms: str | None = None,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Classify a merchant name. Used by the app/dashboard to preview a category."""
-    cat = _learned_category(db, merchant)
+    cat = _learned_category(db, user_id, merchant)
     source = "learned"
     if not cat:
         cat, source = await categorize(merchant, raw_sms)
@@ -386,21 +396,31 @@ def _valid_budget_category(category: str) -> str:
 
 
 @app.get("/budgets", response_model=list[schemas.BudgetOut])
-def list_budgets(db: Session = Depends(get_db)):
-    return db.scalars(select(models.Budget).order_by(models.Budget.category)).all()
+def list_budgets(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    return db.scalars(
+        select(models.Budget)
+        .where(models.Budget.user_id == user_id)
+        .order_by(models.Budget.category)
+    ).all()
 
 
 @app.put("/budgets/{category}", response_model=schemas.BudgetOut)
 def upsert_budget(
-    category: str, payload: schemas.BudgetIn, db: Session = Depends(get_db)
+    category: str,
+    payload: schemas.BudgetIn,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
 ):
     category = _valid_budget_category(category)
-    row = db.get(models.Budget, category)
+    row = db.get(models.Budget, (user_id, category))
     if row:
         row.amount = payload.amount
         row.updated_at = datetime.now(timezone.utc)
     else:
-        row = models.Budget(category=category, amount=payload.amount)
+        row = models.Budget(user_id=user_id, category=category, amount=payload.amount)
         db.add(row)
     db.commit()
     db.refresh(row)
@@ -408,8 +428,12 @@ def upsert_budget(
 
 
 @app.delete("/budgets/{category}", status_code=204)
-def delete_budget(category: str, db: Session = Depends(get_db)):
-    row = db.get(models.Budget, category)
+def delete_budget(
+    category: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    row = db.get(models.Budget, (user_id, category))
     if row is None:
         raise HTTPException(status_code=404, detail="Budget not found")
     db.delete(row)
@@ -417,7 +441,11 @@ def delete_budget(category: str, db: Session = Depends(get_db)):
 
 
 @app.get("/budgets/status")
-def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
+def budgets_status(
+    month: str | None = None,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Each budget with how much of it is spent in the month (default: current
     month, app timezone) — one call for progress bars."""
     if month is None:
@@ -431,6 +459,7 @@ def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
             func.sum(models.Expense.amount),
         )
         .where(
+            models.Expense.user_id == user_id,
             models.Expense.is_labeled.is_(True),
             models.Expense.direction == "debit",  # budgets cap spending, not income
             models.Expense.date >= start,
@@ -444,7 +473,11 @@ def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
     overall_spent = sum(spent.values())
 
     out = []
-    for b in db.scalars(select(models.Budget).order_by(models.Budget.category)):
+    for b in db.scalars(
+        select(models.Budget)
+        .where(models.Budget.user_id == user_id)
+        .order_by(models.Budget.category)
+    ):
         used = overall_spent if b.category == "overall" else spent.get(b.category, 0.0)
         out.append({
             "category": b.category,
@@ -456,7 +489,11 @@ def budgets_status(month: str | None = None, db: Session = Depends(get_db)):
 
 
 @app.get("/summary")
-def summary(month: str | None = None, db: Session = Depends(get_db)):
+def summary(
+    month: str | None = None,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Category totals for a month (default: current month, app timezone).
     Aggregated in SQL so it stays fast no matter how much history exists."""
     if month is None:
@@ -470,6 +507,7 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
             func.sum(models.Expense.amount),
         )
         .where(
+            models.Expense.user_id == user_id,
             models.Expense.is_labeled.is_(True),
             models.Expense.direction == "debit",  # spending only; income is separate
             models.Expense.date >= start,
@@ -486,6 +524,7 @@ def summary(month: str | None = None, db: Session = Depends(get_db)):
     # Income (credits) in the same month — drives the in/out net-flow view.
     income_total = round(float(db.scalar(
         select(func.coalesce(func.sum(models.Expense.amount), 0.0)).where(
+            models.Expense.user_id == user_id,
             models.Expense.direction == "credit",
             models.Expense.date >= start,
             models.Expense.date < end,
@@ -507,11 +546,12 @@ def export_csv(
     month: str | None = None,
     year: int | None = None,
     db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
 ):
     """Download transactions as CSV (opens cleanly in Excel/Sheets). Scope:
     `?month=YYYY-MM` -> that month, `?year=YYYY` -> that whole year, neither ->
     everything. Rows are newest-first; dates are rendered in the app timezone."""
-    stmt = select(models.Expense)
+    stmt = select(models.Expense).where(models.Expense.user_id == user_id)
     scope = "all"
     if month:
         start, end = _month_bounds(month)
@@ -691,13 +731,19 @@ def _detect_recurring(items: list, today: datetime) -> dict | None:
 
 
 @app.get("/recurring")
-def recurring(db: Session = Depends(get_db)):
+def recurring(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Detected recurring payments (subscriptions, EMIs, regular bills) with the
     next due date predicted for each — soonest first, plus the monthly-equivalent
     total they add up to."""
     rows = db.scalars(
         select(models.Expense)
-        .where(models.Expense.direction == "debit")
+        .where(
+            models.Expense.user_id == user_id,
+            models.Expense.direction == "debit",
+        )
         .order_by(models.Expense.date.asc())
     ).all()
 
@@ -709,7 +755,10 @@ def recurring(db: Session = Depends(get_db)):
 
     # Detections the user has dismissed ("I cancelled this") — keyed by the same
     # normalized merchant the detector groups on, so they're skipped here.
-    dismissed_rows = db.scalars(select(models.RecurringDismissal)).all()
+    dismissed_rows = db.scalars(
+        select(models.RecurringDismissal)
+        .where(models.RecurringDismissal.user_id == user_id)
+    ).all()
     dismissed = {d.merchant_norm for d in dismissed_rows}
 
     today = datetime.now(APP_TZ)
@@ -736,23 +785,31 @@ class DismissIn(BaseModel):
 
 
 @app.post("/recurring/dismiss")
-def dismiss_recurring(payload: DismissIn, db: Session = Depends(get_db)):
+def dismiss_recurring(
+    payload: DismissIn,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Hide a detected recurring payment (the user cancelled the subscription /
     doesn't want it tracked). Idempotent; reversible via DELETE."""
     norm = normalize(payload.merchant)
     if not norm:
         raise HTTPException(status_code=400, detail="merchant required")
-    if db.get(models.RecurringDismissal, norm) is None:
+    if db.get(models.RecurringDismissal, (user_id, norm)) is None:
         db.add(models.RecurringDismissal(
-            merchant_norm=norm, merchant_display=payload.merchant))
+            user_id=user_id, merchant_norm=norm, merchant_display=payload.merchant))
         db.commit()
     return {"merchant": payload.merchant, "dismissed": True}
 
 
 @app.delete("/recurring/dismiss/{merchant}", status_code=204)
-def restore_recurring(merchant: str, db: Session = Depends(get_db)):
+def restore_recurring(
+    merchant: str,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
     """Un-dismiss a recurring payment so it can be detected again (undo)."""
-    row = db.get(models.RecurringDismissal, normalize(merchant))
+    row = db.get(models.RecurringDismissal, (user_id, normalize(merchant)))
     if row is not None:
         db.delete(row)
         db.commit()

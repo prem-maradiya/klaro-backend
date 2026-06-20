@@ -48,13 +48,10 @@ def test_health_open(client):
     assert client.get("/health").status_code == 200
 
 
-def test_api_key_enforced(client, monkeypatch):
-    # The middleware reads the module-level API_KEY; flip it on for this test.
-    monkeypatch.setattr("app.main.API_KEY", "secret")
-    assert client.get("/expenses").status_code == 401          # missing key
-    assert client.get("/health").status_code == 200            # exempt
-    ok = client.get("/expenses", headers={"X-API-Key": "secret"})
-    assert ok.status_code == 200
+def test_protected_routes_require_auth(unauth_client):
+    # No bearer token -> 401 on a user route; /health stays open.
+    assert unauth_client.get("/expenses").status_code == 401
+    assert unauth_client.get("/health").status_code == 200
 
 
 # --------------------------------------------------------------------------- #
@@ -214,3 +211,40 @@ def test_learned_rename_applies_to_future(client):
         raw_sms="paytm abcstore 2")).json()
     assert nxt["merchant"] == "Corner Store"
     assert nxt["category"] == "Grocery"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-tenancy — the core Phase 7 guarantee: one user can never see another's.
+# --------------------------------------------------------------------------- #
+def test_users_cannot_see_each_others_expenses(client, client_b):
+    a = client.post("/expenses", json=_expense(merchant="A-Shop", amount=10)).json()
+    client_b.post("/expenses", json=_expense(merchant="B-Shop", amount=20))
+
+    a_list = client.get("/expenses").json()
+    b_list = client_b.get("/expenses").json()
+    assert [e["merchant"] for e in a_list] == ["A-Shop"]
+    assert [e["merchant"] for e in b_list] == ["B-Shop"]
+
+    # B cannot read, edit, or delete A's row by id.
+    assert client_b.get(f"/expenses/{a['id']}").status_code == 404
+    assert client_b.patch(f"/expenses/{a['id']}", json={"category": "Food"}).status_code == 404
+    assert client_b.delete(f"/expenses/{a['id']}").status_code == 404
+    # A's row is untouched.
+    assert client.get(f"/expenses/{a['id']}").status_code == 200
+
+
+def test_summary_and_recurring_are_per_user(client, client_b):
+    client.post("/expenses", json=_expense(amount=100, category="Food"))
+    client_b.post("/expenses", json=_expense(amount=999, category="Food"))
+    assert client.get("/summary").json()["expense_total"] == 100.0
+    assert client_b.get("/summary").json()["expense_total"] == 999.0
+
+
+def test_budgets_and_dismissals_are_per_user(client, client_b):
+    client.put("/budgets/Food", json={"amount": 1000})
+    assert client.get("/budgets").json()[0]["amount"] == 1000.0
+    assert client_b.get("/budgets").json() == []          # B sees none of A's budgets
+
+    client.post("/recurring/dismiss", json={"merchant": "Netflix"})
+    assert client.get("/recurring").json()["dismissed"] == ["Netflix"]
+    assert client_b.get("/recurring").json()["dismissed"] == []

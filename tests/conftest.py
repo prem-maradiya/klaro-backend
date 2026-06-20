@@ -1,30 +1,32 @@
-"""Pytest fixtures: run the FastAPI app against a throwaway in-memory SQLite DB.
+"""Pytest fixtures: run the FastAPI app against a throwaway in-memory SQLite DB
+with auth stubbed to a controllable test user.
 
-The app's real engine (Postgres) is never touched — we set DATABASE_URL to
-SQLite *before* importing the app, override the `get_db` dependency to a test
-session, create the schema per-test, and build the TestClient WITHOUT the
-lifespan context manager (so the Postgres-specific `_ensure_schema` never runs).
+The app's real engine (Postgres) is never touched — we override the `get_db`
+dependency to a SQLite session and the `get_current_user` dependency to a fixed
+user id, create the schema per-test, and build the TestClient WITHOUT the
+lifespan context manager (so the Postgres-specific startup never runs).
 """
 import os
 
-# The app's real engine (Postgres, built at import time) is never connected:
-# we override get_db to a SQLite session and skip the lifespan. We only force
-# auth open here; DATABASE_URL keeps its Postgres default so create_engine
-# accepts the prod pool settings.
-os.environ["API_KEY"] = ""  # open auth by default; auth test sets it explicitly
+# Force auth open is no longer relevant (per-user auth); keep API_KEY unset.
+os.environ["API_KEY"] = ""
 
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import models  # noqa: F401 — registers tables on Base
+from app.auth import get_current_user
 from app.database import Base, get_db
 from app.main import app
 
-# One shared in-memory database for the whole test session. StaticPool keeps a
-# single connection so every session sees the same tables/rows.
+# Two stable test users so isolation tests can prove A can't see B's data.
+USER_A = "11111111-1111-1111-1111-111111111111"
+USER_B = "22222222-2222-2222-2222-222222222222"
+
 _engine = create_engine(
     "sqlite://",
     connect_args={"check_same_thread": False},
@@ -41,25 +43,44 @@ def _override_get_db():
         db.close()
 
 
+# dependency_overrides is global to the app, so we can't bind one client to
+# USER_A and another to USER_B via a closure. Instead the override reads the
+# user from a per-request header, and each client sets its own default header —
+# letting two clients act as different users against the same app/DB.
+def _override_current_user(request: Request) -> str:
+    return request.headers.get("x-test-user", USER_A)
+
+
+def _make_client(user_id: str) -> TestClient:
+    app.dependency_overrides[get_db] = _override_get_db
+    app.dependency_overrides[get_current_user] = _override_current_user
+    # No `with` block: skip lifespan so the real Postgres engine is never hit.
+    return TestClient(app, headers={"x-test-user": user_id})
+
+
 @pytest.fixture()
 def client():
-    """A TestClient with a fresh schema. Tables are dropped after each test so
-    cases stay isolated."""
+    """A TestClient authenticated as USER_A, with a fresh schema."""
     Base.metadata.create_all(bind=_engine)
-    app.dependency_overrides[get_db] = _override_get_db
-    # No `with` block: skip lifespan so the real Postgres engine is never hit.
-    yield TestClient(app)
+    yield _make_client(USER_A)
     app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=_engine)
 
 
 @pytest.fixture()
-def db():
-    """Direct DB session for tests that seed rows without going through the API."""
+def client_b():
+    """A second TestClient authenticated as USER_B, sharing the same DB as
+    `client` (do not drop here — the `client` fixture owns the schema lifecycle).
+    Use together with `client` for cross-user isolation tests."""
+    return _make_client(USER_B)
+
+
+@pytest.fixture()
+def unauth_client():
+    """DB overridden but auth NOT — to assert protected routes reject requests
+    with no/invalid token."""
     Base.metadata.create_all(bind=_engine)
-    session = _TestSession()
-    try:
-        yield session
-    finally:
-        session.close()
-        Base.metadata.drop_all(bind=_engine)
+    app.dependency_overrides[get_db] = _override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=_engine)
