@@ -100,6 +100,42 @@ def test_ingest_dedupes_same_raw_ref(client):
     assert e1.id == e2.id  # the duplicate returned the same row
 
 
+def test_ingest_text_creates_expense(client, monkeypatch):
+    # No Groq key in tests, so stub the AI parser to a known transaction.
+    async def fake_parse(body, sender=""):
+        return {"is_transaction": True, "amount": 250.0,
+                "merchant": "Starbucks", "method": "card", "category": "Food"}
+    monkeypatch.setattr("app.main.ai_parse_sms", fake_parse)
+
+    r = client.post("/ingest/text", json={"text": "debited Rs 250 at STARBUCKS"})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["merchant"] == "Starbucks"
+    assert body["amount"] == 250.0
+    assert body["source"] == "email"      # default source for text import
+    assert body["category"] == "Food"
+
+
+def test_ingest_text_422_when_not_a_transaction(client, monkeypatch):
+    async def fake_parse(body, sender=""):
+        return {"is_transaction": False}
+    monkeypatch.setattr("app.main.ai_parse_sms", fake_parse)
+
+    r = client.post("/ingest/text", json={"text": "Your OTP is 123456"})
+    assert r.status_code == 422
+
+
+def test_ingest_text_honors_source(client, monkeypatch):
+    async def fake_parse(body, sender=""):
+        return {"is_transaction": True, "amount": 99.0,
+                "merchant": "Shop", "method": "upi", "category": None}
+    monkeypatch.setattr("app.main.ai_parse_sms", fake_parse)
+
+    r = client.post("/ingest/text", json={"text": "paid 99", "source": "upi"})
+    assert r.status_code == 201
+    assert r.json()["source"] == "upi"
+
+
 def test_ingest_credit_files_as_income(client):
     db = _session()
     cand = TxnCandidate(

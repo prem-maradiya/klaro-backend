@@ -23,7 +23,14 @@ from .database import Base, engine, get_db
 from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
 from .auth import get_current_user
 from .config import APP_TZ, APP_TZ_NAME
-from .ingestion import candidate_from_expense_create, ingest, learned_category, remember
+from .ingestion import (
+    VALID_SOURCES,
+    TxnCandidate,
+    candidate_from_expense_create,
+    ingest,
+    learned_category,
+    remember,
+)
 from .observability import RATE_PARSE, init_sentry, limiter
 
 # Error tracking — enabled only when SENTRY_DSN is set (no-op otherwise). Called
@@ -273,6 +280,53 @@ async def parse_sms(
         remember(db, user_id, result["merchant"], result["category"], source="ai")
         db.commit()
     return result
+
+
+class IngestTextIn(BaseModel):
+    text: str
+    # Where the pasted/forwarded text came from. Drives the compliant (no-SMS)
+    # import on the Play build: a UPI/receipt SMS or a bank email body.
+    source: str = "email"
+
+
+@app.post("/ingest/text", response_model=schemas.ExpenseOut, status_code=201)
+@limiter.limit(RATE_PARSE)
+async def ingest_text(
+    request: Request,
+    response: Response,
+    payload: IngestTextIn,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """Compliant non-SMS import: extract a transaction from pasted/forwarded text
+    (a UPI/receipt SMS or a bank email) with the AI parser, then run it through
+    the same ingestion pipeline as everything else. This is how the Play build
+    (no SMS permission) and the dashboard import transactions. 422 if no completed
+    transaction can be extracted; a duplicate returns the existing row with 200."""
+    parsed = await ai_parse_sms(payload.text, "")
+    if not parsed.get("is_transaction"):
+        raise HTTPException(
+            status_code=422,
+            detail="Could not find a completed transaction in the text.",
+        )
+    src = (payload.source or "").strip().lower()
+    if src not in VALID_SOURCES:
+        src = "email"
+    candidate = TxnCandidate(
+        merchant=parsed.get("merchant") or "Unknown",
+        amount=parsed["amount"],
+        date=datetime.now(APP_TZ),
+        direction="debit",  # the AI parser extracts completed debits only
+        source=src,
+        method=parsed.get("method") or "upi",
+        raw_ref=payload.text,
+        category=parsed.get("category"),
+        is_labeled=bool(parsed.get("category")),
+    )
+    expense, created = await ingest(db, user_id, candidate)
+    if not created:
+        response.status_code = 200
+    return expense
 
 
 @app.get("/categorize")

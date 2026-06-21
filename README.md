@@ -99,5 +99,6 @@ Blueprint → connect this repo). Note Render's free tier spins down after
 | GET    | `/months`             | Months having data, with count + total       |
 | GET    | `/summary`            | Category totals; `?month=YYYY-MM`            |
 | POST   | `/parse-sms`          | AI fallback parser for unrecognized bank SMS |
+| POST   | `/ingest/text`        | Compliant non-SMS import: extract + ingest a txn from pasted/forwarded text (Play build, dashboard) |
 | GET    | `/categorize`         | Preview a merchant's category                |
 | GET    | `/health`             | Liveness (no auth)                           |
