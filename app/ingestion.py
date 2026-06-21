@@ -1,0 +1,213 @@
+"""Source-agnostic ingestion pipeline (Phase 7.3).
+
+Every way a transaction can enter Klaro — manual entry, an on-device SMS parse,
+a UPI/receipt-email import, and (Phase 8) an Account Aggregator feed — is first
+normalized into a single `TxnCandidate`. The pipeline below then does the same
+work regardless of where it came from: dedupe → categorize → learn → store. So
+adding a new source later is "just another adapter that produces a TxnCandidate";
+none of the dedupe/categorize/learn/store logic has to change.
+"""
+import hashlib
+import re
+
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from . import models, schemas
+from .categorizer import categorize, normalize
+from .config import APP_TZ
+from datetime import datetime, timedelta
+
+# Where a transaction came from. The pipeline is identical for all of them; the
+# value is recorded on the row for analytics and so the Play (no-SMS) vs power
+# (SMS) builds, and a future Account Aggregator feed, are distinguishable.
+VALID_SOURCES = {"manual", "sms", "email", "upi", "aa"}
+
+# A retry / re-import is the same SMS text + amount within this window, not a new
+# transaction (the same payment SMS can arrive with slightly different spacing).
+DEDUPE_WINDOW = timedelta(minutes=5)
+
+
+class TxnCandidate(BaseModel):
+    """A normalized transaction, regardless of its source. Adapters build one of
+    these; `ingest()` consumes it."""
+    merchant: str = ""
+    amount: float
+    date: datetime
+    direction: str = "debit"          # debit = money out | credit = money in
+    source: str = "manual"            # manual | sms | email | upi | aa
+    method: str = "upi"               # upi | card
+    upi_id: str | None = None
+    # Original text/id this candidate came from, used for dedupe. For SMS it's the
+    # message body; empty => no dedupe (manual entries always create).
+    raw_ref: str = ""
+    # A caller-supplied label, if any (e.g. a manual entry the user categorized,
+    # or a credit already known to be Income). Unlabeled debits get auto-filed.
+    category: str | None = None
+    is_labeled: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Merchant learning — the user's corrections + AI/brand classifications, cached
+# per user so they auto-apply to and survive future imports. Lives here because
+# the ingest pipeline both reads (apply learned mapping) and writes (remember
+# auto-classifications) it; the API layer reuses these for PATCH/categorize.
+# --------------------------------------------------------------------------- #
+def sms_hash(raw_ref: str | None) -> str | None:
+    if not raw_ref or not raw_ref.strip():
+        return None
+    # Hash with ALL whitespace removed: the same SMS arrives with slightly
+    # different spacing depending on the capture path (live broadcast vs inbox
+    # read — observed "<Mob.No>" vs "<Mob. No>"), and that must not defeat dedupe.
+    return hashlib.sha256(re.sub(r"\s+", "", raw_ref).encode("utf-8")).hexdigest()
+
+
+def learned_category(db: Session, user_id: str, merchant: str) -> str | None:
+    norm = normalize(merchant)
+    if not norm:
+        return None
+    row = db.get(models.MerchantCategory, (user_id, norm))
+    return row.category if row else None
+
+
+def learned_mapping(db: Session, user_id: str, merchant: str):
+    norm = normalize(merchant)
+    return db.get(models.MerchantCategory, (user_id, norm)) if norm else None
+
+
+def remember(db: Session, user_id: str, merchant: str, category: str | None = None,
+             source: str = "user", display: str | None = None):
+    """Learn a merchant for this user. `merchant` is the key (normalized).
+    `display` is the preferred name to show (defaults to merchant) — used to learn
+    RENAMES so a parsed name maps to the user's chosen name on future txns."""
+    norm = normalize(merchant)
+    if not norm:
+        return
+    row = db.get(models.MerchantCategory, (user_id, norm))
+    if row:
+        if category:
+            row.category = category
+        if display:
+            row.merchant_display = display
+        row.source = source
+    else:
+        db.add(models.MerchantCategory(
+            user_id=user_id,
+            merchant_norm=norm,
+            merchant_display=display or merchant,
+            category=category or "Other",
+            source=source,
+        ))
+
+
+# --------------------------------------------------------------------------- #
+# Adapters: raw input -> TxnCandidate.
+# --------------------------------------------------------------------------- #
+def candidate_from_expense_create(payload: "schemas.ExpenseCreate") -> TxnCandidate:
+    """Adapt the client's create payload into a candidate. The phone already does
+    the SMS parsing on-device, so this is mostly a field map — but it also infers
+    the source when the client doesn't send one (older app builds)."""
+    src = (payload.source or "").strip().lower()
+    if src not in VALID_SOURCES:
+        # No/invalid source: a non-empty raw_sms means it came from an SMS parse;
+        # otherwise it's a manual entry.
+        src = "sms" if (payload.raw_sms or "").strip() else "manual"
+    return TxnCandidate(
+        merchant=payload.merchant or "",
+        amount=payload.amount,
+        date=payload.date,
+        direction=payload.direction,
+        source=src,
+        method=payload.method,
+        upi_id=payload.upi_id,
+        raw_ref=payload.raw_sms or "",
+        category=payload.category,
+        is_labeled=payload.is_labeled,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The pipeline.
+# --------------------------------------------------------------------------- #
+def _find_duplicate(db: Session, user_id: str, amount: float, date: datetime,
+                    hash_: str) -> models.Expense | None:
+    return db.scalars(
+        select(models.Expense)
+        .where(
+            models.Expense.user_id == user_id,
+            models.Expense.raw_sms_hash == hash_,
+            models.Expense.amount == amount,
+            models.Expense.date >= date - DEDUPE_WINDOW,
+            models.Expense.date <= date + DEDUPE_WINDOW,
+        )
+        .limit(1)
+    ).first()
+
+
+async def ingest(db: Session, user_id: str, cand: TxnCandidate) -> tuple[models.Expense, bool]:
+    """Run a candidate through dedupe -> categorize -> learn -> store.
+
+    Returns `(expense, created)` — `created` is False when an existing row was
+    returned because the candidate was a duplicate (so the caller can answer 200
+    instead of 201). Commits on success.
+    """
+    # The phone sends timezone-naive local timestamps (IST wall-clock). Treat
+    # naive datetimes as APP_TZ — never as server time (UTC in the cloud), which
+    # would shift every transaction by the offset.
+    date = cand.date if cand.date.tzinfo else cand.date.replace(tzinfo=APP_TZ)
+    merchant = cand.merchant or ""
+
+    # Dedupe: a matching hash + amount within the window is a retry/re-import.
+    hash_ = sms_hash(cand.raw_ref)
+    if hash_:
+        existing = _find_duplicate(db, user_id, cand.amount, date, hash_)
+        if existing is not None:
+            return existing, False
+
+    category = cand.category
+    is_labeled = cand.is_labeled
+
+    if cand.direction == "credit":
+        # Income: the "merchant" is the payer, not a vendor — don't run spend
+        # categorization or learn a merchant->category from it (that would poison
+        # future debits). Just file it under Income.
+        category = category or "Income"
+        is_labeled = True
+    else:
+        # Apply any learned mapping for this merchant: a remembered RENAME and/or
+        # category, so the user's corrections persist and survive re-imports.
+        mapping = learned_mapping(db, user_id, merchant)
+        if mapping:
+            if mapping.merchant_display and normalize(mapping.merchant_display) != normalize(merchant):
+                merchant = mapping.merchant_display
+            if mapping.category:
+                category = mapping.category
+                is_labeled = True
+        # Auto-categorize anything still unlabeled (brand -> keyword -> AI).
+        if not is_labeled or not category:
+            cat, csource = await categorize(merchant or "", cand.raw_ref or None)
+            if cat:
+                category = cat
+                is_labeled = True
+                if csource in ("ai", "brand", "keyword"):
+                    remember(db, user_id, cand.merchant or "", cat, csource)
+
+    expense = models.Expense(
+        user_id=user_id,
+        merchant=merchant,
+        amount=cand.amount,
+        date=date,
+        raw_sms=cand.raw_ref,
+        raw_sms_hash=hash_,
+        upi_id=cand.upi_id,
+        is_labeled=is_labeled,
+        category=category,
+        method=cand.method,
+        direction=cand.direction,
+        source=cand.source,
+    )
+    db.add(expense)
+    db.commit()
+    db.refresh(expense)
+    return expense, True

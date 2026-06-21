@@ -92,7 +92,7 @@ Blueprint → connect this repo). Note Render's free tier spins down after
 | Method | Path                  | Purpose                                      |
 |--------|-----------------------|----------------------------------------------|
 | GET    | `/expenses`           | List (newest first); `?month=YYYY-MM`, `skip`/`limit`, `unlabeled_only`; `X-Total-Count` header |
-| POST   | `/expenses`           | Create (dedupes by SMS hash; auto-categorizes) |
+| POST   | `/expenses`           | Create via the source-agnostic ingestion pipeline (dedupes by SMS hash; auto-categorizes; records `source`) |
 | GET    | `/expenses/{id}`      | Get one expense                              |
 | PATCH  | `/expenses/{id}`      | Update label/category (learns renames)       |
 | DELETE | `/expenses/{id}`      | Delete an expense                            |

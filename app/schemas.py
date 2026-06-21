@@ -12,6 +12,9 @@ class ExpenseBase(BaseModel):
     category: str | None = None
     method: str = "upi"  # upi | card
     direction: str = "debit"  # debit = money out, credit = money in (income)
+    # How it entered Klaro: manual | sms | email | upi | aa. Optional on create
+    # (the server infers it from raw_sms for older app builds); always returned.
+    source: str | None = None
 
 
 class ExpenseCreate(ExpenseBase):

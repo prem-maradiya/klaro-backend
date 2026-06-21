@@ -32,6 +32,11 @@ class Expense(Base):
     direction: Mapped[str] = mapped_column(
         String(10), default="debit", server_default="debit", index=True
     )
+    # Where the transaction entered Klaro (Phase 7.3 ingestion abstraction):
+    # manual | sms | email | upi | aa. Historical rows were SMS-captured.
+    source: Mapped[str] = mapped_column(
+        String(20), default="sms", server_default="sms"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

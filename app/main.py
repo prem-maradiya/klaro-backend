@@ -1,5 +1,4 @@
 import csv
-import hashlib
 import io
 import logging
 import os
@@ -8,7 +7,6 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from statistics import median
-from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +22,8 @@ from . import models, schemas
 from .database import Base, engine, get_db
 from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
 from .auth import get_current_user
+from .config import APP_TZ, APP_TZ_NAME
+from .ingestion import candidate_from_expense_create, ingest, learned_category, remember
 from .observability import RATE_PARSE, init_sentry, limiter
 
 # Error tracking — enabled only when SENTRY_DSN is set (no-op otherwise). Called
@@ -41,17 +41,6 @@ CORS_ORIGINS = [
     o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
 ]
 
-# Months are bucketed in the user's timezone, not UTC — a payment at 00:30 IST
-# on the 1st belongs to the new month even though it's still last month in UTC.
-APP_TZ_NAME = os.getenv("APP_TZ", "Asia/Kolkata")
-try:
-    APP_TZ = ZoneInfo(APP_TZ_NAME)
-except Exception:
-    # No IANA tz database on this host (slim serverless images) — fall back to
-    # a fixed IST offset. APP_TZ_NAME is still used (and valid) in Postgres.
-    APP_TZ = timezone(timedelta(hours=5, minutes=30))
-
-
 def _month_bounds(month: str) -> tuple[datetime, datetime]:
     """'YYYY-MM' -> [start, end) as UTC instants of that local-tz month."""
     try:
@@ -66,55 +55,6 @@ def _month_bounds(month: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def _sms_hash(raw_sms: str | None) -> str | None:
-    if not raw_sms or not raw_sms.strip():
-        return None
-    # Hash with ALL whitespace removed: the same SMS arrives with slightly
-    # different spacing depending on the capture path (live broadcast vs inbox
-    # read — observed "<Mob.No>" vs "<Mob. No>" in one IDBI message), and that
-    # must not defeat dedupe.
-    return hashlib.sha256(re.sub(r"\s+", "", raw_sms).encode("utf-8")).hexdigest()
-
-
-def _learned_category(db: Session, user_id: str, merchant: str) -> str | None:
-    norm = normalize(merchant)
-    if not norm:
-        return None
-    row = db.get(models.MerchantCategory, (user_id, norm))
-    return row.category if row else None
-
-
-def _remember(db: Session, user_id: str, merchant: str, category: str | None = None,
-              source: str = "user", display: str | None = None):
-    """Learn a merchant for this user. `merchant` is the key (normalized).
-    `display` is the preferred name to show (defaults to merchant) — used to
-    learn RENAMES so a parsed name maps to the user's chosen name on future
-    transactions."""
-    norm = normalize(merchant)
-    if not norm:
-        return
-    row = db.get(models.MerchantCategory, (user_id, norm))
-    if row:
-        if category:
-            row.category = category
-        if display:
-            row.merchant_display = display
-        row.source = source
-    else:
-        db.add(models.MerchantCategory(
-            user_id=user_id,
-            merchant_norm=norm,
-            merchant_display=display or merchant,
-            category=category or "Other",
-            source=source,
-        ))
-
-
-def _learned_mapping(db: Session, user_id: str, merchant: str):
-    norm = normalize(merchant)
-    return db.get(models.MerchantCategory, (user_id, norm)) if norm else None
-
-
 def _ensure_schema() -> None:
     """Idempotent column adds that create_all can't apply to an existing table
     (it only creates whole missing tables). Runs on every startup so a deploy
@@ -127,6 +67,11 @@ def _ensure_schema() -> None:
         ))
         conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_expenses_direction ON expenses (direction)"
+        ))
+        # Phase 7.3: ingestion source. Existing rows were SMS-captured.
+        conn.execute(text(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS source "
+            "VARCHAR(20) NOT NULL DEFAULT 'sms'"
         ))
 
 
@@ -186,71 +131,14 @@ async def create_expense(
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),
 ):
-    data = payload.model_dump()
-    data["user_id"] = user_id
-    merchant = data.get("merchant") or ""
-
-    # The phone sends timezone-naive local timestamps (IST wall-clock). Treat
-    # naive datetimes as APP_TZ — never as server time, which is UTC in the
-    # cloud and would shift every transaction by +5:30.
-    if data["date"].tzinfo is None:
-        data["date"] = data["date"].replace(tzinfo=APP_TZ)
-
-    # Server-side dedupe: same SMS text + amount within a ±5 min window means a
-    # retry or re-import, never a new transaction — return the existing row
-    # (200) so clients can never double-count. Manual entries (no raw_sms) skip
-    # this and are always created.
-    sms_hash = _sms_hash(data.get("raw_sms"))
-    data["raw_sms_hash"] = sms_hash
-    if sms_hash:
-        window = timedelta(minutes=5)
-        existing = db.scalars(
-            select(models.Expense)
-            .where(
-                models.Expense.user_id == user_id,
-                models.Expense.raw_sms_hash == sms_hash,
-                models.Expense.amount == data["amount"],
-                models.Expense.date >= data["date"] - window,
-                models.Expense.date <= data["date"] + window,
-            )
-            .limit(1)
-        ).first()
-        if existing:
-            response.status_code = 200
-            return existing
-
-    if data.get("direction") == "credit":
-        # Income: the "merchant" is the payer, not a vendor — so don't run spend
-        # categorization or learn a merchant->category mapping from it (that would
-        # poison future debits). Just file it under the Income bucket.
-        if not data.get("category"):
-            data["category"] = "Income"
-        data["is_labeled"] = True
-    else:
-        # Apply any learned mapping for this merchant: a remembered RENAME (preferred
-        # display name) and/or category. This makes the user's corrections persist,
-        # apply to ALL future transactions, and survive re-imports.
-        mapping = _learned_mapping(db, user_id, merchant)
-        if mapping:
-            if mapping.merchant_display and normalize(mapping.merchant_display) != normalize(merchant):
-                data["merchant"] = mapping.merchant_display
-            if mapping.category:
-                data["category"] = mapping.category
-                data["is_labeled"] = True
-
-        # Auto-categorize anything still unlabeled (brand -> keyword -> AI).
-        if not data.get("is_labeled") or not data.get("category"):
-            cat, source = await categorize(data.get("merchant") or "", data.get("raw_sms"))
-            if cat:
-                data["category"] = cat
-                data["is_labeled"] = True
-                if source in ("ai", "brand", "keyword"):
-                    _remember(db, user_id, merchant, cat, source)
-
-    expense = models.Expense(**data)
-    db.add(expense)
-    db.commit()
-    db.refresh(expense)
+    # Thin adapter over the source-agnostic ingestion pipeline (Phase 7.3): turn
+    # the client payload into a normalized candidate, then dedupe/categorize/
+    # learn/store it. A duplicate returns the existing row with 200 (not 201) so
+    # clients can never double-count.
+    candidate = candidate_from_expense_create(payload)
+    expense, created = await ingest(db, user_id, candidate)
+    if not created:
+        response.status_code = 200
     return expense
 
 
@@ -343,11 +231,11 @@ def update_expense(
 
     # Learn the user's correction so it auto-applies to future transactions.
     if expense.merchant and expense.category:
-        _remember(db, user_id, expense.merchant, expense.category, source="user")
+        remember(db, user_id, expense.merchant, expense.category, source="user")
         # Rename learning: map the ORIGINAL parsed name -> the user's chosen
         # name, so future SMS that parse to the original show the user's name.
         if normalize(old_merchant) and normalize(old_merchant) != normalize(expense.merchant):
-            _remember(db, user_id, old_merchant, expense.category, source="user", display=expense.merchant)
+            remember(db, user_id, old_merchant, expense.category, source="user", display=expense.merchant)
 
     db.commit()
     db.refresh(expense)
@@ -382,7 +270,7 @@ async def parse_sms(
     result = await ai_parse_sms(payload.body, payload.sender)
     # Cache the merchant->category so future identical merchants are instant.
     if result.get("is_transaction") and result.get("category") and result.get("merchant"):
-        _remember(db, user_id, result["merchant"], result["category"], source="ai")
+        remember(db, user_id, result["merchant"], result["category"], source="ai")
         db.commit()
     return result
 
@@ -395,7 +283,7 @@ async def categorize_merchant(
     user_id: str = Depends(get_current_user),
 ):
     """Classify a merchant name. Used by the app/dashboard to preview a category."""
-    cat = _learned_category(db, user_id, merchant)
+    cat = learned_category(db, user_id, merchant)
     source = "learned"
     if not cat:
         cat, source = await categorize(merchant, raw_sms)
