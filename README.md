@@ -68,9 +68,24 @@ Blueprint → connect this repo). Note Render's free tier spins down after
 
 ## Security
 
-- `API_KEY` env var set → every endpoint except `/` and `/health` requires
-  the `X-API-Key` header. Unset → open (local dev).
-- `CORS_ORIGINS` env var (comma-separated) restricts browser origins.
+- **Auth (Phase 7.1+):** every endpoint except `/` and `/health` requires a
+  valid Supabase JWT (`Authorization: Bearer …`). The backend verifies the
+  ES256 signature against the project JWKS (`SUPABASE_URL`) — no shared secret —
+  and scopes every query to the token's `user_id`. In unit tests auth is
+  overridden (see `tests/conftest.py`).
+- **CORS:** `CORS_ORIGINS` (comma-separated) restricts browser origins.
+- **Rate limiting (Phase 7.5):** on by default — a global per-user/IP cap plus a
+  tighter limit on the AI `/parse-sms` route; `/` and `/health` are exempt.
+  Tune via `RATELIMIT_*` (see `.env.example`).
+
+## Ops & observability (Phase 7.5)
+
+- **Error tracking:** set `SENTRY_DSN` to enable Sentry (no-op when unset; never
+  sends PII).
+- **Backups:** `python scripts/backup_db.py` writes a gzipped `pg_dump` under
+  `backups/` (Supabase also keeps daily backups).
+- **Runbook:** deploy, secret rotation, restore, incident steps and monitoring
+  live in [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Endpoints
 

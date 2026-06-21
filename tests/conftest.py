@@ -11,6 +11,12 @@ import os
 # Force auth open is no longer relevant (per-user auth); keep API_KEY unset.
 os.environ["API_KEY"] = ""
 
+# Rate limiting: keep the default cap effectively unlimited for the functional
+# tests (the dedicated rate-limit test uses its own low-limit route). Set BEFORE
+# importing the app so observability.limiter reads these.
+os.environ.setdefault("RATELIMIT_DEFAULT", "100000/minute")
+os.environ.setdefault("RATELIMIT_PARSE", "100000/minute")
+
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
@@ -22,6 +28,7 @@ from app import models  # noqa: F401 — registers tables on Base
 from app.auth import get_current_user
 from app.database import Base, get_db
 from app.main import app
+from app.observability import limiter
 
 # Two stable test users so isolation tests can prove A can't see B's data.
 USER_A = "11111111-1111-1111-1111-111111111111"
@@ -62,6 +69,7 @@ def _make_client(user_id: str) -> TestClient:
 def client():
     """A TestClient authenticated as USER_A, with a fresh schema."""
     Base.metadata.create_all(bind=_engine)
+    limiter.reset()  # clear rate-limit counters so tests don't bleed into each other
     yield _make_client(USER_A)
     app.dependency_overrides.clear()
     Base.metadata.drop_all(bind=_engine)

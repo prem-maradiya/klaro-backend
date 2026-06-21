@@ -10,8 +10,11 @@ from datetime import datetime, timedelta, timezone
 from statistics import median
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import case, func, select, text
 from sqlalchemy.orm import Session
 
@@ -21,6 +24,11 @@ from . import models, schemas
 from .database import Base, engine, get_db
 from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
 from .auth import get_current_user
+from .observability import RATE_PARSE, init_sentry, limiter
+
+# Error tracking — enabled only when SENTRY_DSN is set (no-op otherwise). Called
+# before the app is built so it instruments request handling from the first call.
+init_sentry()
 
 # Auth is per-user now (Phase 7.1): data routes depend on get_current_user,
 # which verifies a Supabase JWT and yields the user's id. The old global
@@ -137,6 +145,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Expense Tracker API", version="1.0.0", lifespan=lifespan)
 
+# Rate limiting (Phase 7.5). The default cap from observability.limiter applies
+# to every route via SlowAPIMiddleware; /health and / are exempted below so
+# uptime monitors are never throttled. Added BEFORE CORS so CORS stays the
+# outermost middleware and 429 responses still carry CORS headers for the
+# browser dashboard.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 
 # Allow the Flutter app (mobile + web dashboard) to call the API.
 # Added after the auth middleware so it runs first and answers preflights.
@@ -151,12 +168,14 @@ app.add_middleware(
 
 
 @app.get("/")
-def root():
+@limiter.exempt
+def root(request: Request):
     return {"status": "ok", "service": "expense-tracker-api"}
 
 
 @app.get("/health")
-def health():
+@limiter.exempt
+def health(request: Request):
     return {"status": "healthy"}
 
 
@@ -351,7 +370,9 @@ class ParseSmsIn(BaseModel):
 
 
 @app.post("/parse-sms")
+@limiter.limit(RATE_PARSE)
 async def parse_sms(
+    request: Request,
     payload: ParseSmsIn,
     db: Session = Depends(get_db),
     user_id: str = Depends(get_current_user),

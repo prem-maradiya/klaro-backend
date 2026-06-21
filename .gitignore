@@ -7,3 +7,6 @@ venv/
 .pytest_cache/
 
 .vercel
+
+# Local DB dumps from scripts/backup_db.py — never commit data.
+backups/
