@@ -1,7 +1,38 @@
-# Klaro Backend (Expense Tracker API)
+<div align="center">
 
-FastAPI + PostgreSQL backend for the Klaro expense-tracking app
-(SMS auto-capture on Android) and its web dashboard.
+# Klaro Backend — Expense Tracker API
+
+**Multi-tenant FastAPI backend for [Klaro](https://github.com/prem-maradiya/klaro-app) — the
+SMS-auto-capture expense tracker — and its web dashboard.**
+
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Supabase](https://img.shields.io/badge/Postgres-Supabase-3ECF8E?logo=supabase&logoColor=white)](https://supabase.com)
+[![Deploy](https://img.shields.io/badge/Deployed-Vercel-000?logo=vercel&logoColor=white)](https://klaro-api.vercel.app)
+[![Tests](https://img.shields.io/badge/tests-pytest-0A9EDC?logo=pytest&logoColor=white)](#tests)
+
+</div>
+
+FastAPI + Supabase Postgres backend for the Klaro expense-tracking app
+(SMS auto-capture on Android) and its web dashboard. Handles identity, per-user
+data isolation (row-level scoping), a source-agnostic ingestion pipeline, and an
+AI fallback parser for unrecognized bank SMS formats.
+
+## How it fits together
+
+```
+📱 Klaro app  ──┐
+                ├──HTTPS + Supabase JWT──►  THIS API (FastAPI · Vercel)
+🌐 Dashboard ──┘                                  │
+                                                  ├──►  Supabase (Postgres + Auth + RLS)
+                                                  └─ ⤳  Groq LLM (unknown-SMS fallback)
+```
+
+Every transaction — parsed SMS, manual entry, or pasted/forwarded text — flows
+through one `TxnCandidate` contract and a single `ingest()` pipeline
+(*dedupe → categorize → learn → store*), so adding a new source never touches the
+storage logic. Modules: `auth` (JWT/JWKS) · `ingestion` (pipeline) · `categorizer`
+· `observability` (rate limit + Sentry) · `models`/`schemas`/`database`.
 
 ## Local setup
 
@@ -46,19 +77,14 @@ zero-config detection routes FastAPI apps into Vercel's framework preset,
 which broke this deploy in several ways (see `.vercelignore` note about
 render.yaml too).
 
-Env vars (set on the Vercel project): `API_KEY`, `GROQ_API_KEY`, `GROQ_MODEL`,
-`CORS_ORIGINS`, `DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=3`, and — once the database
-exists — `DATABASE_URL`.
+**Database: Supabase Postgres** (free tier). The app uses the **session pooler**
+connection string and Supabase Auth (ES256 JWT verified against the project JWKS —
+no shared secret on the backend). Tables are created automatically on first start.
 
-**Remaining one-time step — database (Neon, free, ~5 min):**
-1. Sign up at https://neon.tech (free tier, no card), create a project.
-2. Copy the **pooled** connection string (`postgresql://...-pooler...neon.tech/neondb?sslmode=require`).
-3. `printf '%s' "<that string>" | npx vercel env add DATABASE_URL production`
-   (run in this folder), then `npx vercel deploy --prod --yes`.
-4. Tables are created automatically on first start.
-
-To migrate existing local data to Neon:
-`pg_dump -d expense_tracker | psql "<neon connection string>"`.
+Env vars (set on the Vercel project): `DATABASE_URL` (Supabase pooled string),
+`SUPABASE_URL` (for JWKS verification), `GROQ_API_KEY`, `GROQ_MODEL`,
+`CORS_ORIGINS`, `DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=3`, and optionally
+`SENTRY_DSN`, `RATELIMIT_*`. See `.env.example` for the full list.
 
 ### Alternative: Render (render.yaml)
 
