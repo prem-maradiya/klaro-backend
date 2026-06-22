@@ -80,6 +80,16 @@ def _ensure_schema() -> None:
             "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS source "
             "VARCHAR(20) NOT NULL DEFAULT 'sms'"
         ))
+        # Budget scoping. Existing rows keep counting toward the budget (in_budget
+        # TRUE) and need no review — the heuristic applies to new captures only.
+        conn.execute(text(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS in_budget "
+            "BOOLEAN NOT NULL DEFAULT TRUE"
+        ))
+        conn.execute(text(
+            "ALTER TABLE expenses ADD COLUMN IF NOT EXISTS budget_review "
+            "BOOLEAN NOT NULL DEFAULT FALSE"
+        ))
 
 
 @asynccontextmanager
@@ -425,6 +435,7 @@ def budgets_status(
             models.Expense.user_id == user_id,
             models.Expense.is_labeled.is_(True),
             models.Expense.direction == "debit",  # budgets cap spending, not income
+            models.Expense.in_budget.is_(True),   # exclude one-off/fee payments
             models.Expense.date >= start,
             models.Expense.date < end,
         )
@@ -449,6 +460,24 @@ def budgets_status(
             "pct": round(used / b.amount * 100, 1) if b.amount else 0.0,
         })
     return {"month": month, "budgets": out}
+
+
+@app.get("/budget/review", response_model=list[schemas.ExpenseOut])
+def budget_review_queue(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """Large / fee-like payments captured but held out of the budget, awaiting the
+    user's include/exclude decision (newest first). The app shows these in a review
+    card; deciding one is a PATCH that sets in_budget and clears budget_review."""
+    return db.scalars(
+        select(models.Expense)
+        .where(
+            models.Expense.user_id == user_id,
+            models.Expense.budget_review.is_(True),
+        )
+        .order_by(models.Expense.date.desc())
+    ).all()
 
 
 @app.get("/summary")
@@ -484,6 +513,21 @@ def summary(
         totals[cat] = round(totals.get(cat, 0.0) + float(amt or 0), 2)
     expense_total = round(sum(totals.values()), 2)
 
+    # Budget split: how much of the month's spending actually counts toward the
+    # budget vs. how much is large one-off / fee payments held out of it. The
+    # donut + expense_total stay TOTAL (honest); the budget bar uses budgeted.
+    budgeted_total = round(float(db.scalar(
+        select(func.coalesce(func.sum(models.Expense.amount), 0.0)).where(
+            models.Expense.user_id == user_id,
+            models.Expense.is_labeled.is_(True),
+            models.Expense.direction == "debit",
+            models.Expense.in_budget.is_(True),
+            models.Expense.date >= start,
+            models.Expense.date < end,
+        )
+    ) or 0.0), 2)
+    oneoff_total = round(expense_total - budgeted_total, 2)
+
     # Income (credits) in the same month — drives the in/out net-flow view.
     income_total = round(float(db.scalar(
         select(func.coalesce(func.sum(models.Expense.amount), 0.0)).where(
@@ -499,7 +543,9 @@ def summary(
         "month_total": expense_total,  # spending only — kept for back-compat
         "by_category": totals,
         "income_total": income_total,
-        "expense_total": expense_total,
+        "expense_total": expense_total,        # all spending (incl. one-offs)
+        "budgeted_total": budgeted_total,      # spending that counts toward budget
+        "oneoff_total": oneoff_total,          # large/fee payments held out
         "net": round(income_total - expense_total, 2),
     }
 

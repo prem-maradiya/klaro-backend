@@ -37,6 +37,14 @@ class Expense(Base):
     source: Mapped[str] = mapped_column(
         String(20), default="sms", server_default="sms"
     )
+    # Budget scoping. A budget caps day-to-day spending, so large one-off / fixed
+    # payments (college fees, rent, a laptop) shouldn't count against it.
+    #   in_budget      — does this spend count toward the monthly budget? (default yes)
+    #   budget_review  — a large/fee-like capture held OUT of the budget pending the
+    #                    user's decision; surfaced for review, never auto-counted so
+    #                    it can't trigger a false "budget exceeded".
+    in_budget: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    budget_review: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

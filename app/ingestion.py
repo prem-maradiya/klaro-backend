@@ -9,6 +9,7 @@ none of the dedupe/categorize/learn/store logic has to change.
 """
 import hashlib
 import re
+from statistics import median
 
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -27,6 +28,61 @@ VALID_SOURCES = {"manual", "sms", "email", "upi", "aa"}
 # A retry / re-import is the same SMS text + amount within this window, not a new
 # transaction (the same payment SMS can arrive with slightly different spacing).
 DEDUPE_WINDOW = timedelta(minutes=5)
+
+# --- Budget scoping heuristic ------------------------------------------------ #
+# A monthly budget is for day-to-day spending. A large one-off / fixed payment
+# (college fees, rent, a laptop) would blow it up, so those are held OUT of the
+# budget and surfaced for the user to decide. Normal small spends flow in
+# automatically — the user is only ever interrupted for the rare big one.
+#
+# A debit is treated as "large / fee-like" (→ held out, flagged for review) when:
+#   • its amount ≥ max(FLOOR, MULTIPLE × the user's typical spend), or
+#   • the merchant / SMS text mentions a fee-like word (fees, tuition, rent…).
+BUDGET_LARGE_FLOOR = 5000.0    # ₹ — "large" for a user with little/no history yet
+BUDGET_LARGE_MULTIPLE = 3.0    # …or this many times the user's typical spend
+BUDGET_MIN_HISTORY = 8         # need at least this many debits to trust a median
+BUDGET_TYPICAL_WINDOW = 100    # median over the most recent N budgeted debits
+BUDGET_FEE_RE = re.compile(
+    r"\b(fees?|tuition|admission|semester|hostel|college|university|"
+    r"exam|rent|deposit|insurance|premium)\b",
+    re.IGNORECASE,
+)
+
+
+def _typical_debit(db: Session, user_id: str) -> float | None:
+    """Median of the user's recent budgeted debits — the baseline a new spend is
+    compared against. None until there's enough history to be meaningful (so a
+    brand-new user falls back to the absolute floor instead of a noisy median)."""
+    amounts = db.scalars(
+        select(models.Expense.amount)
+        .where(
+            models.Expense.user_id == user_id,
+            models.Expense.direction == "debit",
+            models.Expense.in_budget.is_(True),
+        )
+        .order_by(models.Expense.created_at.desc())
+        .limit(BUDGET_TYPICAL_WINDOW)
+    ).all()
+    if len(amounts) < BUDGET_MIN_HISTORY:
+        return None
+    return float(median(amounts))
+
+
+def assess_budget(db: Session, user_id: str, cand: "TxnCandidate") -> tuple[bool, bool]:
+    """Decide (in_budget, budget_review) for a candidate. Credits/income never
+    count toward a spending budget. A large or fee-like debit is held out
+    (in_budget=False) and flagged for review (budget_review=True); everything else
+    flows in automatically."""
+    if cand.direction != "debit":
+        return True, False
+    blob = f"{cand.merchant or ''} {cand.raw_ref or ''}"
+    fee_like = bool(BUDGET_FEE_RE.search(blob))
+    typical = _typical_debit(db, user_id)
+    threshold = max(BUDGET_LARGE_FLOOR, (typical or 0.0) * BUDGET_LARGE_MULTIPLE)
+    large = cand.amount >= threshold
+    if fee_like or large:
+        return False, True
+    return True, False
 
 
 class TxnCandidate(BaseModel):
@@ -193,6 +249,10 @@ async def ingest(db: Session, user_id: str, cand: TxnCandidate) -> tuple[models.
                 if csource in ("ai", "brand", "keyword"):
                     remember(db, user_id, cand.merchant or "", cat, csource)
 
+    # Budget scoping: small day-to-day spends count automatically; a large or
+    # fee-like one is held out and flagged for the user to include/exclude.
+    in_budget, budget_review = assess_budget(db, user_id, cand)
+
     expense = models.Expense(
         user_id=user_id,
         merchant=merchant,
@@ -206,6 +266,8 @@ async def ingest(db: Session, user_id: str, cand: TxnCandidate) -> tuple[models.
         method=cand.method,
         direction=cand.direction,
         source=cand.source,
+        in_budget=in_budget,
+        budget_review=budget_review,
     )
     db.add(expense)
     db.commit()
