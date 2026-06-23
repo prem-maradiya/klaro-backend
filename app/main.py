@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from sqlalchemy import case, func, select, text
+from sqlalchemy import case, delete, func, select, text
 from sqlalchemy.orm import Session
 
 from pydantic import BaseModel
@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from . import models, schemas
 from .database import Base, engine, get_db
 from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
-from .auth import get_current_user
+from .auth import delete_auth_user, get_current_user
 from .config import APP_TZ, APP_TZ_NAME
 from .ingestion import (
     VALID_SOURCES,
@@ -822,3 +822,46 @@ def restore_recurring(
     if row is not None:
         db.delete(row)
         db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Account deletion (Play Store / DPDP-Act requirement). Permanently erases the
+# user's data across every table, then deletes their auth account. Irreversible.
+# ---------------------------------------------------------------------------
+
+@app.delete("/account")
+async def delete_account(
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user),
+):
+    """Permanently delete the signed-in user's account and all their data.
+
+    Wipes every user-owned table (expenses, budgets, learned categories,
+    recurring dismissals) in one transaction, then deletes the Supabase Auth
+    record so the account is fully gone. The auth-record delete is best-effort
+    (needs the service-role key configured); the data wipe is the guarantee.
+    Returns a per-table count so the action is auditable. Irreversible — the
+    client confirms with the user before calling this.
+    """
+    deleted: dict[str, int] = {}
+    for table in (
+        models.Expense,
+        models.Budget,
+        models.MerchantCategory,
+        models.RecurringDismissal,
+    ):
+        result = db.execute(
+            delete(table).where(table.user_id == user_id)
+        )
+        deleted[table.__tablename__] = result.rowcount or 0
+    db.commit()
+
+    auth_deleted = await delete_auth_user(user_id)
+
+    return {
+        "status": "deleted",
+        "rows": deleted,
+        # False when the service-role key isn't configured: the data is gone but
+        # the auth record may remain. The client still signs the user out.
+        "auth_account_deleted": auth_deleted,
+    }
