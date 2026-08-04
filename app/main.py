@@ -20,18 +20,16 @@ from pydantic import BaseModel
 
 from . import models, schemas
 from .database import Base, engine, get_db
-from .categorizer import CATEGORIES, categorize, normalize, ai_parse_sms
+from .categorizer import CATEGORIES, categorize, normalize
 from .auth import delete_auth_user, get_current_user
 from .config import APP_TZ, APP_TZ_NAME
 from .ingestion import (
-    VALID_SOURCES,
-    TxnCandidate,
     candidate_from_expense_create,
     ingest,
     learned_category,
     remember,
 )
-from .observability import RATE_PARSE, init_sentry, limiter
+from .observability import init_sentry, limiter
 
 # Error tracking — enabled only when SENTRY_DSN is set (no-op otherwise). Called
 # before the app is built so it instruments request handling from the first call.
@@ -269,74 +267,10 @@ def delete_expense(
     db.commit()
 
 
-class ParseSmsIn(BaseModel):
-    body: str
-    sender: str = ""
-
-
-@app.post("/parse-sms")
-@limiter.limit(RATE_PARSE)
-async def parse_sms(
-    request: Request,
-    payload: ParseSmsIn,
-    db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user),
-):
-    """AI fallback parser for bank SMS the on-device regex couldn't handle.
-    Returns a structured transaction (or is_transaction=false)."""
-    result = await ai_parse_sms(payload.body, payload.sender)
-    # Cache the merchant->category so future identical merchants are instant.
-    if result.get("is_transaction") and result.get("category") and result.get("merchant"):
-        remember(db, user_id, result["merchant"], result["category"], source="ai")
-        db.commit()
-    return result
-
-
-class IngestTextIn(BaseModel):
-    text: str
-    # Where the pasted/forwarded text came from. Drives the compliant (no-SMS)
-    # import on the Play build: a UPI/receipt SMS or a bank email body.
-    source: str = "email"
-
-
-@app.post("/ingest/text", response_model=schemas.ExpenseOut, status_code=201)
-@limiter.limit(RATE_PARSE)
-async def ingest_text(
-    request: Request,
-    response: Response,
-    payload: IngestTextIn,
-    db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user),
-):
-    """Compliant non-SMS import: extract a transaction from pasted/forwarded text
-    (a UPI/receipt SMS or a bank email) with the AI parser, then run it through
-    the same ingestion pipeline as everything else. This is how the Play build
-    (no SMS permission) and the dashboard import transactions. 422 if no completed
-    transaction can be extracted; a duplicate returns the existing row with 200."""
-    parsed = await ai_parse_sms(payload.text, "")
-    if not parsed.get("is_transaction"):
-        raise HTTPException(
-            status_code=422,
-            detail="Could not find a completed transaction in the text.",
-        )
-    src = (payload.source or "").strip().lower()
-    if src not in VALID_SOURCES:
-        src = "email"
-    candidate = TxnCandidate(
-        merchant=parsed.get("merchant") or "Unknown",
-        amount=parsed["amount"],
-        date=datetime.now(APP_TZ),
-        direction="debit",  # the AI parser extracts completed debits only
-        source=src,
-        method=parsed.get("method") or "upi",
-        raw_ref=payload.text,
-        category=parsed.get("category"),
-        is_labeled=bool(parsed.get("category")),
-    )
-    expense, created = await ingest(db, user_id, candidate)
-    if not created:
-        response.status_code = 200
-    return expense
+"""Text/SMS parsing endpoints were removed: parsing is now fully on-device, so
+the raw message never reaches the server (privacy: "SMS never leaves the phone").
+The app parses pasted text locally too and posts the cleaned transaction to
+/expenses like any other capture."""
 
 
 @app.get("/categorize")

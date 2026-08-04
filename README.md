@@ -15,8 +15,12 @@ SMS-auto-capture expense tracker — and its web dashboard.**
 
 FastAPI + Supabase Postgres backend for the Klaro expense-tracking app
 (SMS auto-capture on Android) and its web dashboard. Handles identity, per-user
-data isolation (row-level scoping), a source-agnostic ingestion pipeline, and an
-AI fallback parser for unrecognized bank SMS formats.
+data isolation (row-level scoping) and a source-agnostic ingestion pipeline.
+
+> **Privacy:** SMS parsing happens entirely on the phone. This API only ever
+> receives the *cleaned* transaction (merchant, amount, category, date) plus a
+> one-way hash for de-duplication — never the raw message, account numbers or
+> balances. No LLM is involved anywhere.
 
 ## How it fits together
 
@@ -24,8 +28,7 @@ AI fallback parser for unrecognized bank SMS formats.
 📱 Klaro app  ──┐
                 ├──HTTPS + Supabase JWT──►  THIS API (FastAPI · Vercel)
 🌐 Dashboard ──┘                                  │
-                                                  ├──►  Supabase (Postgres + Auth + RLS)
-                                                  └─ ⤳  Groq LLM (unknown-SMS fallback)
+                                                  └──►  Supabase (Postgres + Auth + RLS)
 ```
 
 Every transaction — parsed SMS, manual entry, or pasted/forwarded text — flows
@@ -82,8 +85,8 @@ connection string and Supabase Auth (ES256 JWT verified against the project JWKS
 no shared secret on the backend). Tables are created automatically on first start.
 
 Env vars (set on the Vercel project): `DATABASE_URL` (Supabase pooled string),
-`SUPABASE_URL` (for JWKS verification), `GROQ_API_KEY`, `GROQ_MODEL`,
-`CORS_ORIGINS`, `DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=3`, and optionally
+`SUPABASE_URL` (for JWKS verification), `SUPABASE_SERVICE_ROLE_KEY` (account
+deletion), `CORS_ORIGINS`, `DB_POOL_SIZE=2`, `DB_MAX_OVERFLOW=3`, and optionally
 `SENTRY_DSN`, `RATELIMIT_*`. See `.env.example` for the full list.
 
 ### Alternative: Render (render.yaml)
@@ -100,9 +103,8 @@ Blueprint → connect this repo). Note Render's free tier spins down after
   and scopes every query to the token's `user_id`. In unit tests auth is
   overridden (see `tests/conftest.py`).
 - **CORS:** `CORS_ORIGINS` (comma-separated) restricts browser origins.
-- **Rate limiting (Phase 7.5):** on by default — a global per-user/IP cap plus a
-  tighter limit on the AI `/parse-sms` route; `/` and `/health` are exempt.
-  Tune via `RATELIMIT_*` (see `.env.example`).
+- **Rate limiting (Phase 7.5):** on by default — a global per-user/IP cap;
+  `/` and `/health` are exempt. Tune via `RATELIMIT_*` (see `.env.example`).
 
 ## Ops & observability (Phase 7.5)
 
@@ -124,7 +126,6 @@ Blueprint → connect this repo). Note Render's free tier spins down after
 | DELETE | `/expenses/{id}`      | Delete an expense                            |
 | GET    | `/months`             | Months having data, with count + total       |
 | GET    | `/summary`            | Category totals; `?month=YYYY-MM`            |
-| POST   | `/parse-sms`          | AI fallback parser for unrecognized bank SMS |
-| POST   | `/ingest/text`        | Compliant non-SMS import: extract + ingest a txn from pasted/forwarded text (Play build, dashboard) |
 | GET    | `/categorize`         | Preview a merchant's category                |
+| DELETE | `/account`            | Delete the user's account and all their data |
 | GET    | `/health`             | Liveness (no auth)                           |

@@ -82,18 +82,15 @@ def _rate_key(request) -> str:
     return f"ip:{get_remote_address(request)}"
 
 
-# Default cap applied to every route via SlowAPIMiddleware; per-route limits
-# (e.g. the AI parser) stack on top of it. Tunable without a code change.
+# Default cap applied to every route via SlowAPIMiddleware; per-route limits can
+# stack on top of it. Tunable without a code change.
 #
 # Sized to Klaro's real bursts, not generic API defaults: a full inbox
 # import/re-import POSTs every parsed SMS sequentially (~125-200 rows) and a cold
 # app open fires several GETs plus pull-reconcile — a worst-case legitimate
 # minute is ~220+ requests. 600/min clears that comfortably while still capping a
-# runaway/malicious client. The AI /parse-sms cap (30/min) sits just above the
-# app's own 25-candidates-per-import ceiling so it never fights a normal import,
-# while still bounding Groq spend.
+# runaway/malicious client.
 RATE_DEFAULT = os.getenv("RATELIMIT_DEFAULT", "600/minute")
-RATE_PARSE = os.getenv("RATELIMIT_PARSE", "30/minute")
 
 limiter = Limiter(
     key_func=_rate_key,

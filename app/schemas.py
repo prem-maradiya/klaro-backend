@@ -6,7 +6,11 @@ class ExpenseBase(BaseModel):
     merchant: str
     amount: float
     date: datetime
+    # raw_sms / upi_id stay optional for back-compat, but the privacy-respecting
+    # app no longer sends them — it parses on-device and uploads only the cleaned
+    # transaction plus raw_sms_hash (a one-way dedupe token, never the text).
     raw_sms: str = ""
+    raw_sms_hash: str | None = None
     upi_id: str | None = None
     is_labeled: bool = True
     category: str | None = None

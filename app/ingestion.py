@@ -98,6 +98,10 @@ class TxnCandidate(BaseModel):
     # Original text/id this candidate came from, used for dedupe. For SMS it's the
     # message body; empty => no dedupe (manual entries always create).
     raw_ref: str = ""
+    # A dedupe hash computed BY THE CLIENT (the privacy-respecting app sends this
+    # instead of the raw SMS). When present it's used directly; otherwise the hash
+    # is derived server-side from raw_ref (manual / text-import paths).
+    raw_sms_hash: str | None = None
     # A caller-supplied label, if any (e.g. a manual entry the user categorized,
     # or a credit already known to be Income). Unlabeled debits get auto-filed.
     category: str | None = None
@@ -178,6 +182,7 @@ def candidate_from_expense_create(payload: "schemas.ExpenseCreate") -> TxnCandid
         method=payload.method,
         upi_id=payload.upi_id,
         raw_ref=payload.raw_sms or "",
+        raw_sms_hash=payload.raw_sms_hash,
         category=payload.category,
         is_labeled=payload.is_labeled,
     )
@@ -215,7 +220,9 @@ async def ingest(db: Session, user_id: str, cand: TxnCandidate) -> tuple[models.
     merchant = cand.merchant or ""
 
     # Dedupe: a matching hash + amount within the window is a retry/re-import.
-    hash_ = sms_hash(cand.raw_ref)
+    # Prefer the client-supplied hash (privacy build sends the hash, not the SMS);
+    # fall back to hashing raw_ref for manual / text-import sources that send text.
+    hash_ = cand.raw_sms_hash or sms_hash(cand.raw_ref)
     if hash_:
         existing = _find_duplicate(db, user_id, cand.amount, date, hash_)
         if existing is not None:
