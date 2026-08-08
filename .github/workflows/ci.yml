@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api:
+    name: API · tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matched to the VERCEL runtime, not to whatever the dev laptop happens to
+      # have. CI exists to catch what breaks in production; testing on a version
+      # production never runs would give a green tick that proves nothing.
+      # Keep this in step with the @vercel/python runtime when that moves.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      # requirements-dev pulls in requirements.txt plus pytest.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # No services needed: the suite runs against in-memory SQLite with auth
+      # stubbed (see tests/conftest.py), so it never touches Postgres/Supabase.
+      # That keeps CI fast, free and safe to run on every push.
+      - name: Test
+        run: pytest -q
