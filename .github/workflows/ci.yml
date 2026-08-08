@@ -39,5 +39,10 @@ jobs:
       # No services needed: the suite runs against in-memory SQLite with auth
       # stubbed (see tests/conftest.py), so it never touches Postgres/Supabase.
       # That keeps CI fast, free and safe to run on every push.
+      #
+      # `python -m pytest`, NOT bare `pytest`: the module form puts the working
+      # directory on sys.path, which is how `app` gets imported. Bare `pytest`
+      # does not, and fails with "No module named 'app'" — this is also exactly
+      # how the suite is run locally, so CI and dev stay in step.
       - name: Test
-        run: pytest -q
+        run: python -m pytest -q
