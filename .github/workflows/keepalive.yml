@@ -1,0 +1,49 @@
+name: Keep the database awake
+
+# Supabase free-tier projects pause after roughly a week with no activity. A
+# paused project's hostname stops resolving entirely, so the symptom is not a
+# slow login — it is every login failing with a network error while the API
+# itself still answers /health normally. That has already bitten this project
+# twice, and it is fatal for a link someone else might click (a recruiter, say)
+# weeks after it was shared.
+#
+# This pings an endpoint that performs a real query, which both keeps the
+# project out of the idle state and fails loudly if it ever gets there anyway.
+#
+# CAVEAT worth knowing: GitHub disables scheduled workflows after 60 days with
+# no commits to the repository (it emails first). For a link that must survive
+# unattended for months, pair this with a free external monitor such as
+# cron-job.org or UptimeRobot pointed at the same URL.
+
+on:
+  schedule:
+    # 06:00 UTC every 3rd day — frequent enough that one skipped run (GitHub
+    # drops scheduled jobs under load) still lands well inside the ~7 day window.
+    - cron: "0 6 */3 * *"
+  workflow_dispatch:
+
+# Never let two pings overlap.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping /health/db
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o body.txt -w '%{http_code}' \
+            --max-time 30 --retry 4 --retry-delay 10 --retry-all-errors \
+            https://klaro-api.vercel.app/health/db)
+          echo "HTTP $code"
+          echo "--- response ---"
+          cat body.txt || true
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Database is not reachable (HTTP $code). The Supabase project is probably paused — restore it at https://supabase.com/dashboard"
+            exit 1
+          fi
+          echo "Database reachable."

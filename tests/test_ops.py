@@ -5,6 +5,9 @@ These don't touch the DB — they exercise the cross-cutting middleware/config.
 from fastapi import Request
 from fastapi.testclient import TestClient
 
+from sqlalchemy.exc import OperationalError
+
+from app.database import get_db
 from app.main import app
 from app.observability import init_sentry, limiter
 
@@ -62,3 +65,41 @@ def test_init_sentry_bad_dsn_is_swallowed(monkeypatch):
     monkeypatch.setenv("SENTRY_DSN", "not-a-valid-dsn")
     # A misconfigured DSN must degrade to "disabled", never crash startup.
     assert init_sentry() is False
+
+
+# --- /health/db -------------------------------------------------------------
+# "/health" is a constant, so it cannot distinguish a working deployment from
+# one whose database has vanished. These pin the endpoint that can.
+
+def test_health_db_reports_reachable(client):
+    r = client.get("/health/db")
+    assert r.status_code == 200
+    assert r.json() == {"status": "healthy", "database": "reachable"}
+
+
+def test_health_db_returns_503_when_database_is_down(client):
+    """The reason this endpoint exists: a paused Supabase project must read as
+    DOWN. Its hostname stops resolving, every query raises, and the old
+    constant-200 /health would still report the service as healthy."""
+
+    class _DeadSession:
+        def execute(self, *args, **kwargs):
+            raise OperationalError(
+                "SELECT 1", {}, Exception("could not translate host name")
+            )
+
+    def _dead_db():
+        yield _DeadSession()
+
+    # The `client` fixture clears dependency_overrides on teardown.
+    app.dependency_overrides[get_db] = _dead_db
+
+    r = client.get("/health/db")
+    assert r.status_code == 503
+    assert "unreachable" in r.text.lower()
+
+
+def test_health_db_is_exempt_from_rate_limiting(client):
+    # The keep-alive pings this on a schedule; throttling it would defeat it.
+    limiter.reset()
+    assert all(client.get("/health/db").status_code == 200 for _ in range(50))

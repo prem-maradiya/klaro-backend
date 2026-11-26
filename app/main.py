@@ -139,6 +139,29 @@ def health(request: Request):
     return {"status": "healthy"}
 
 
+@app.get("/health/db")
+@limiter.exempt
+def health_db(request: Request, db: Session = Depends(get_db)):
+    """Liveness check that actually reaches Postgres.
+
+    "/health" above returns a constant, so it stays green even when the database
+    is unreachable. That is the exact state a free-tier Supabase project enters
+    when it auto-pauses after about a week of inactivity: the API answers
+    normally while every real query fails and nobody can sign in.
+
+    This endpoint runs a trivial query instead, so it serves two purposes:
+    an uptime monitor can detect the paused state, and the traffic itself keeps
+    the project from being judged idle in the first place. 503 on failure so a
+    monitor treats it as down rather than reading a 200 with a sad message.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        logging.exception("/health/db: database unreachable")
+        raise HTTPException(status_code=503, detail="database unreachable")
+    return {"status": "healthy", "database": "reachable"}
+
+
 @app.post("/expenses", response_model=schemas.ExpenseOut, status_code=201)
 async def create_expense(
     payload: schemas.ExpenseCreate,
